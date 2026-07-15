@@ -1,0 +1,37 @@
+# Debian 用 systemd ユニットファイル
+# インストール手順:
+#   sudo mkdir -p /opt/cloudservice
+#   sudo cp cloudserver userctl /opt/cloudservice/          (ビルド済みバイナリ)
+#   sudo cp -r certs web config.json /opt/cloudservice/
+#   sudo useradd --system --home /opt/cloudservice --shell /usr/sbin/nologin cloudservice
+#   sudo chown -R cloudservice:cloudservice /opt/cloudservice
+#   sudo cp deploy/cloudservice.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cloudservice
+
+[Unit]
+Description=Cloud Service (file sharing server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudservice
+Group=cloudservice
+WorkingDirectory=/opt/cloudservice
+ExecStart=/opt/cloudservice/cloudserver -config /opt/cloudservice/config.json
+Restart=on-failure
+RestartSec=5
+
+# セキュリティ強化
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cloudservice/data
+PrivateTmp=true
+# 443 など特権ポートで待ち受ける場合は次の 2 行を有効化
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# サーバー: 秘密鍵・証明書・ユーザーデータはコミットしない
+server/certs/*.key
+server/certs/*.crt
+server/certs/*.pem
+server/data/
+server/config.json
+server/cloudserver
+server/userctl
+
+# Go
+server/bin/
+
+# クライアント
+client/node_modules/
+client/dist/
+
+# その他
+*.log
+.DS_Store
