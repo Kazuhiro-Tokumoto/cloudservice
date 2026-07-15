@@ -1,12 +1,11 @@
+/* シンプルな白基調テーマ */
 :root {
-  --bg: #f5f7fa;
-  --panel: #ffffff;
-  --border: #d9e0e8;
-  --text: #1c2733;
-  --muted: #667585;
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --danger: #dc2626;
+  --bg: #ffffff;
+  --border: #e8e8e8;
+  --text: #1a1a1a;
+  --muted: #8a8a8a;
+  --accent: #1a1a1a;
+  --danger: #c0392b;
 }
 
 * {
@@ -18,19 +17,34 @@ body {
   font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
   background: var(--bg);
   color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
 }
 
 button {
   font: inherit;
   border: 1px solid var(--border);
-  background: var(--panel);
+  background: #fff;
   border-radius: 6px;
-  padding: 6px 12px;
+  padding: 6px 14px;
   cursor: pointer;
+  color: var(--text);
+  transition: background 0.15s;
 }
 
 button:hover {
-  background: #eef2f7;
+  background: #f6f6f6;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 button.primary {
@@ -40,30 +54,70 @@ button.primary {
 }
 
 button.primary:hover {
-  background: var(--accent-hover);
+  background: #333;
 }
 
-button.danger {
-  color: var(--danger);
+button.ghost {
+  border: none;
+  color: var(--muted);
+  padding: 4px 8px;
+}
+
+button.ghost:hover {
+  color: var(--text);
+  background: none;
 }
 
 button.link {
   border: none;
   background: none;
-  color: var(--accent);
-  padding: 2px 4px;
+  color: var(--text);
+  padding: 2px 6px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--border);
+}
+
+button.link:hover {
+  text-decoration-color: var(--text);
+  background: none;
+}
+
+button.link.danger {
+  color: var(--danger);
 }
 
 input,
-select {
+select,
+textarea {
   font: inherit;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px 10px;
+  padding: 7px 10px;
   background: #fff;
+  color: var(--text);
 }
 
-/* ログイン画面 */
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: #bbb;
+}
+
+textarea {
+  width: 100%;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
+
+label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ログイン・共有リンク画面 */
 .login-wrap {
   min-height: 100vh;
   display: flex;
@@ -72,69 +126,82 @@ select {
 }
 
 .login-card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 32px;
-  width: 340px;
+  width: 360px;
+  padding: 40px 32px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
 }
 
 .login-card h1 {
-  margin: 0 0 8px;
-  font-size: 1.3rem;
+  margin: 0 0 4px;
+  font-size: 1.15rem;
   text-align: center;
+  letter-spacing: 0.05em;
 }
 
-.login-card .note {
-  font-size: 0.78rem;
+.login-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.note {
+  font-size: 0.8rem;
   color: var(--muted);
 }
 
-/* メイン画面 */
+/* ヘッダー */
 header.topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 20px;
-  background: var(--panel);
+  padding: 14px 24px;
   border-bottom: 1px solid var(--border);
 }
 
 header.topbar h1 {
   margin: 0;
-  font-size: 1.1rem;
+  font-size: 1rem;
+  letter-spacing: 0.05em;
 }
 
 .userbox {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   color: var(--muted);
-  font-size: 0.9rem;
+  font-size: 0.88rem;
 }
 
+.lock {
+  font-size: 0.8rem;
+}
+
+/* 本文 */
 main {
-  max-width: 960px;
-  margin: 20px auto;
-  padding: 0 16px;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px 20px 60px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
-}
-
-section.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
+  gap: 36px;
 }
 
 section.panel h2 {
-  margin: 0 0 12px;
+  margin: 0 0 14px;
   font-size: 1rem;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+section.panel h3 {
+  margin: 20px 0 8px;
+  font-size: 0.88rem;
+  color: var(--muted);
+  font-weight: 600;
 }
 
 .toolbar {
@@ -146,28 +213,34 @@ section.panel h2 {
 }
 
 .breadcrumb {
-  font-size: 0.9rem;
-  margin-bottom: 10px;
+  font-size: 0.88rem;
+  margin-bottom: 8px;
   color: var(--muted);
 }
 
+/* テーブル */
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.92rem;
+  font-size: 0.9rem;
 }
 
 th,
 td {
   text-align: left;
-  padding: 8px 10px;
+  padding: 9px 10px;
   border-bottom: 1px solid var(--border);
 }
 
 th {
   color: var(--muted);
-  font-weight: 600;
-  font-size: 0.82rem;
+  font-weight: 500;
+  font-size: 0.78rem;
+}
+
+td.muted {
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 td.actions {
@@ -177,49 +250,69 @@ td.actions {
 
 .name-cell {
   cursor: pointer;
-  color: var(--accent);
 }
 
-.name-cell.plain {
-  color: var(--text);
-  cursor: default;
+.name-cell:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.name-cell .icon {
+  margin-right: 8px;
 }
 
 .empty {
   color: var(--muted);
-  padding: 12px 4px;
-  font-size: 0.9rem;
+  padding: 14px 4px;
+  font-size: 0.88rem;
 }
 
 .error-banner {
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  border: 1px solid #efc7c2;
   color: var(--danger);
   border-radius: 8px;
   padding: 10px 14px;
-  margin-bottom: 12px;
   white-space: pre-wrap;
+  font-size: 0.88rem;
 }
 
 .share-url {
-  font-family: monospace;
-  font-size: 0.85rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
+  color: var(--muted);
+}
+
+/* ダイアログ */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  width: 400px;
+  max-width: calc(100vw - 40px);
+}
+
+dialog.wide {
+  width: 680px;
+}
+
+dialog h2 {
+  margin: 0 0 14px;
+  font-size: 0.95rem;
   word-break: break-all;
 }
 
-dialog {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 20px;
-  width: 380px;
+dialog input,
+dialog label {
+  display: flex;
+  width: 100%;
+  margin-bottom: 10px;
 }
 
-dialog form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+dialog .toolbar {
+  margin: 14px 0 0;
 }
 
 dialog::backdrop {
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(0, 0, 0, 0.25);
 }

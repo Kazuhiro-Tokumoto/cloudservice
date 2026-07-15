@@ -15,6 +15,14 @@ export interface Share {
   target_user: string;
   created_at: string;
   expires_at: string;
+  wrapped_key?: string;
+}
+
+export interface KeyBundle {
+  v: number;
+  public_key: string;
+  enc_private_key: string;
+  enc_master_key: string;
 }
 
 export interface ShareList {
@@ -87,16 +95,19 @@ export async function uploadFile(path: string, file: Blob): Promise<void> {
   });
 }
 
-export async function downloadFile(path: string): Promise<Blob> {
+export async function downloadFile(path: string): Promise<Uint8Array> {
   const res = await request(
     `/api/files/download?path=${encodeURIComponent(path)}`,
   );
-  return res.blob();
+  return new Uint8Array(await res.arrayBuffer());
 }
 
-export async function readTextFile(path: string): Promise<string> {
-  const blob = await downloadFile(path);
-  return blob.text();
+// 暗号化ヘッダー(包んだファイル鍵)だけ読みたいとき用。先頭バイトのみ取得する。
+export async function downloadFileHeader(path: string): Promise<Uint8Array> {
+  const res = await request(
+    `/api/files/download?path=${encodeURIComponent(path)}&limit=512`,
+  );
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 export async function deleteFile(path: string): Promise<void> {
@@ -118,6 +129,45 @@ export async function listUsers(): Promise<string[]> {
   return res.json();
 }
 
+// --- 鍵管理 ---
+
+export async function getKeyBundle(): Promise<KeyBundle | null> {
+  try {
+    const res = await request("/api/keys");
+    return await res.json();
+  } catch {
+    return null; // 未登録(初回ログイン)
+  }
+}
+
+export async function putKeyBundle(
+  bundle: KeyBundle,
+  force = false,
+): Promise<void> {
+  await request(`/api/keys${force ? "?force=1" : ""}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bundle),
+  });
+}
+
+export async function getUserPublicKey(username: string): Promise<string> {
+  const res = await request(`/api/keys/user/${encodeURIComponent(username)}`);
+  const body = await res.json();
+  return body.public_key;
+}
+
+export async function changePassword(
+  newAuthKey: string,
+  bundle: KeyBundle,
+): Promise<void> {
+  await request("/api/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ new_auth_key: newAuthKey, key_bundle: bundle }),
+  });
+}
+
 export async function listShares(): Promise<ShareList> {
   const res = await request("/api/shares");
   return res.json();
@@ -127,6 +177,7 @@ export async function createShare(
   path: string,
   targetUser: string,
   expiresDays: number,
+  wrappedKey: string,
 ): Promise<{ share: Share; url?: string }> {
   const res = await request("/api/shares", {
     method: "POST",
@@ -135,6 +186,7 @@ export async function createShare(
       path,
       target_user: targetUser,
       expires_days: expiresDays,
+      wrapped_key: wrappedKey,
     }),
   });
   return res.json();
@@ -144,7 +196,28 @@ export async function deleteShare(id: string): Promise<void> {
   await request(`/api/shares/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
-export async function downloadShared(id: string): Promise<Blob> {
+export async function downloadShared(id: string): Promise<Uint8Array> {
   const res = await request(`/api/shared/download?id=${encodeURIComponent(id)}`);
-  return res.blob();
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+// リンク共有のブロブ取得(認証不要)。ファイル名は Content-Disposition から取る。
+export async function downloadPublicShare(
+  token: string,
+): Promise<{ data: Uint8Array; filename: string }> {
+  const res = await fetch(`/api/public/share/${encodeURIComponent(token)}`);
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body.error) msg = body.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+  const cd = res.headers.get("Content-Disposition") ?? "";
+  const m = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(cd);
+  const filename = m ? decodeURIComponent(m[1].replace(/"$/, "")) : "download";
+  return { data: new Uint8Array(await res.arrayBuffer()), filename };
 }

@@ -35,7 +35,8 @@ func (s *Server) Handler() http.Handler {
 
 	// 認証不要
 	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("GET /s/{token}", s.handlePublicShare)
+	// リンク共有の暗号化ブロブ取得。復号は Web クライアント(/s/... ページ)がブラウザ内で行う。
+	mux.HandleFunc("GET /api/public/share/{token}", s.handlePublicShare)
 
 	// 認証必須
 	mux.Handle("GET /api/me", s.authed(s.handleMe))
@@ -45,6 +46,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/files", s.authed(s.handleDelete))
 	mux.Handle("POST /api/files/mkdir", s.authed(s.handleMkdir))
 	mux.Handle("GET /api/users", s.authed(s.handleUsers))
+	mux.Handle("GET /api/keys", s.authed(s.handleGetKeys))
+	mux.Handle("PUT /api/keys", s.authed(s.handlePutKeys))
+	mux.Handle("GET /api/keys/user/{name}", s.authed(s.handleUserPublicKey))
+	mux.Handle("POST /api/password", s.authed(s.handleChangePassword))
 	mux.Handle("GET /api/shares", s.authed(s.handleShares))
 	mux.Handle("POST /api/shares", s.authed(s.handleCreateShare))
 	mux.Handle("DELETE /api/shares/{id}", s.authed(s.handleDeleteShare))
@@ -170,6 +175,86 @@ func (s *Server) handleUsers(w http.ResponseWriter, _ *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, s.Store.ListUsers())
 }
 
+// --- 鍵管理(サーバーは鍵バンドルを不透明データとして保管するだけで中身は復号できない) ---
+
+const maxKeyBundleSize = 16 * 1024
+
+func (s *Server) handleGetKeys(w http.ResponseWriter, _ *http.Request, username string) {
+	u, ok := s.Store.GetUser(username)
+	if !ok || len(u.KeyBundle) == 0 {
+		writeErr(w, http.StatusNotFound, "鍵バンドルが未登録です")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Write(u.KeyBundle)
+}
+
+func (s *Server) handlePutKeys(w http.ResponseWriter, r *http.Request, username string) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxKeyBundleSize))
+	if err != nil || !json.Valid(body) {
+		writeErr(w, http.StatusBadRequest, "鍵バンドルの形式が不正です")
+		return
+	}
+	overwrite := r.URL.Query().Get("force") == "1"
+	if err := s.Store.SetKeyBundle(username, body, overwrite); err != nil {
+		if errors.Is(err, store.ErrKeyBundleExists) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+func (s *Server) handleUserPublicKey(w http.ResponseWriter, r *http.Request, _ string) {
+	name := r.PathValue("name")
+	u, ok := s.Store.GetUser(name)
+	if !ok || len(u.KeyBundle) == 0 {
+		writeErr(w, http.StatusNotFound, "そのユーザーはまだ鍵を登録していません(一度もログインしていない可能性があります)")
+		return
+	}
+	var bundle struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(u.KeyBundle, &bundle); err != nil || bundle.PublicKey == "" {
+		writeErr(w, http.StatusNotFound, "公開鍵が見つかりません")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"username":   name,
+		"public_key": bundle.PublicKey,
+	})
+}
+
+// handleChangePassword は認証キーと鍵バンドルをまとめて更新する。
+// 鍵の再包み(マスター鍵を新しい包み鍵で暗号化し直す)はクライアント側で行われるため、
+// マスター鍵は変わらず既存ファイルはそのまま読める。
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, username string) {
+	var req struct {
+		NewAuthKey string          `json:"new_auth_key"`
+		KeyBundle  json.RawMessage `json:"key_bundle"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxKeyBundleSize+4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
+		return
+	}
+	if len(req.NewAuthKey) != 64 || len(req.KeyBundle) == 0 {
+		writeErr(w, http.StatusBadRequest, "新しい認証キーと鍵バンドルが必要です")
+		return
+	}
+	hash, err := auth.HashAuthKey(req.NewAuthKey)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.Store.SetAuthAndKeyBundle(username, hash, req.KeyBundle); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
+}
+
 // --- ファイル操作 ---
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, username string) {
@@ -181,8 +266,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, username str
 	writeJSON(w, http.StatusOK, entries)
 }
 
-func serveFile(w http.ResponseWriter, r *http.Request, f *os.File, name string, size int64) {
+// serveFile はファイル(中身は暗号化済みブロブ)をそのまま送出する。
+// limit > 0 なら先頭 limit バイトだけを返す(暗号化ヘッダーのみ読みたい場合用)。
+func serveFile(w http.ResponseWriter, r *http.Request, f *os.File, name string, size, limit int64) {
 	defer f.Close()
+	if limit > 0 && limit < size {
+		size = limit
+	}
 	ctype := mime.TypeByExtension(path.Ext(name))
 	if ctype == "" {
 		ctype = "application/octet-stream"
@@ -191,7 +281,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, f *os.File, name string, 
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
 	if r.Method != http.MethodHead {
-		io.Copy(w, f)
+		io.CopyN(w, f, size)
 	}
 }
 
@@ -202,7 +292,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, username
 		fileError(w, err)
 		return
 	}
-	serveFile(w, r, f, info.Name(), info.Size())
+	limit, _ := strconv.ParseInt(r.URL.Query().Get("limit"), 10, 64)
+	serveFile(w, r, f, info.Name(), info.Size(), limit)
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, username string) {
@@ -263,8 +354,9 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request, usern
 		Path        string `json:"path"`
 		TargetUser  string `json:"target_user"`  // 空ならリンク共有
 		ExpiresDays int    `json:"expires_days"` // 0 = 無期限
+		WrappedKey  string `json:"wrapped_key"`  // 共有先の公開鍵で包んだファイル鍵
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
 		return
 	}
@@ -291,6 +383,11 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request, usern
 			writeErr(w, http.StatusBadRequest, "自分自身には共有できません")
 			return
 		}
+		// E2E 暗号化のため、共有先が復号できるよう包み直したファイル鍵が必須
+		if req.WrappedKey == "" {
+			writeErr(w, http.StatusBadRequest, "wrapped_key(共有先の公開鍵で包んだファイル鍵)が必要です")
+			return
+		}
 	}
 	id, err := auth.NewShareToken()
 	if err != nil {
@@ -302,6 +399,7 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request, usern
 		Owner:      username,
 		Path:       rel,
 		TargetUser: req.TargetUser,
+		WrappedKey: req.WrappedKey,
 		CreatedAt:  time.Now(),
 	}
 	if req.ExpiresDays > 0 {
@@ -326,7 +424,8 @@ func (s *Server) handleDeleteShare(w http.ResponseWriter, r *http.Request, usern
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-// handleSharedDownload は自分宛に共有されたファイルをダウンロードする。
+// handleSharedDownload は自分宛に共有されたファイル(暗号化ブロブ)をダウンロードする。
+// 復号は共有レコードの wrapped_key を使ってクライアント側で行う。
 func (s *Server) handleSharedDownload(w http.ResponseWriter, r *http.Request, username string) {
 	sh, ok := s.Store.GetShare(r.URL.Query().Get("id"))
 	if !ok || sh.TargetUser != username {
@@ -338,10 +437,12 @@ func (s *Server) handleSharedDownload(w http.ResponseWriter, r *http.Request, us
 		fileError(w, err)
 		return
 	}
-	serveFile(w, r, f, info.Name(), info.Size())
+	serveFile(w, r, f, info.Name(), info.Size(), 0)
 }
 
-// handlePublicShare はリンク共有(認証不要)のダウンロード。
+// handlePublicShare はリンク共有の暗号化ブロブを返す(認証不要)。
+// ファイル鍵は共有 URL のフラグメント(#k=...)にありサーバーへは送られないため、
+// サーバー(とこのエンドポイント単体)では復号できない。
 func (s *Server) handlePublicShare(w http.ResponseWriter, r *http.Request) {
 	sh, ok := s.Store.GetShare(r.PathValue("token"))
 	if !ok || sh.TargetUser != "" {
@@ -353,5 +454,5 @@ func (s *Server) handlePublicShare(w http.ResponseWriter, r *http.Request) {
 		fileError(w, err)
 		return
 	}
-	serveFile(w, r, f, info.Name(), info.Size())
+	serveFile(w, r, f, info.Name(), info.Size(), 0)
 }
