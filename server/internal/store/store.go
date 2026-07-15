@@ -214,6 +214,17 @@ func (s *Store) GetUser(username string) (User, bool) {
 	return u, ok
 }
 
+// Users は全ユーザーの情報を返す(管理用)。
+func (s *Store) Users() []User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	us := make([]User, 0, len(s.users))
+	for _, u := range s.users {
+		us = append(us, u)
+	}
+	return us
+}
+
 // ListUsers は全ユーザー名を返す。
 func (s *Store) ListUsers() []string {
 	s.mu.Lock()

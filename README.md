@@ -66,14 +66,10 @@ config.example.json は Let's Encrypt の証明書を直接参照する設定に
 sudo ./cloudserver -config config.json
 ```
 
-証明書は起動時に一度だけ読み込まれるため、certbot の更新(約 90 日ごと)後は
-サーバーの再起動が必要。忘れないように更新フックを入れておくと楽:
-
-```sh
-echo 'systemctl try-restart cloudservice 2>/dev/null || pkill -x cloudserver' | \
-  sudo tee /etc/letsencrypt/renewal-hooks/deploy/cloudservice-restart.sh
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/cloudservice-restart.sh
-```
+**証明書の更新は自動で反映される。** サーバーは 1 時間ごと
+(`cert_check_minutes` で変更可)に証明書ファイルを確認して再読み込みするため、
+certbot が更新しても再起動は不要。期限切れが近い/切れている場合は
+ログと `userctl status` で警告が出る。
 
 (root で動かしたくない場合は `deploy/letsencrypt-deploy-hook.sh` で
 証明書を `certs/` にコピーして一般ユーザーで動かす方式も使える)
@@ -103,14 +99,20 @@ cp config.example.json config.json
 ブラウザからは `https://mail.shudo-physics.com:40000/` でアクセスする
 (Web クライアントも同じサーバーが配信するので、これ 1 つで完結)。
 
-### 4. ユーザーを作る(管理者のみ)
+### 4. ユーザー管理(管理者のみ)
 
 ```sh
-./userctl -data data add <ユーザー名> <パスワード>   # 追加
-./userctl -data data passwd <ユーザー名> <新パスワード> # パスワードリセット(注意あり)
-./userctl -data data del <ユーザー名>                 # 削除
-./userctl -data data list                             # 一覧
+./userctl -data data add <ユーザー名> <パスワード>      # 追加
+./userctl -data data passwd <ユーザー名> <新パスワード>  # パスワードリセット(注意あり)
+./userctl -data data del <ユーザー名>                   # 削除(ファイルは残る)
+./userctl -data data list                               # 一覧(使用容量・鍵登録状況つき)
+./userctl -data data status                             # サーバー状態(稼働時間・証明書期限)
 ```
+
+**サーバーを止める必要はない。** サーバー稼働中は data ディレクトリ内の
+管理ソケット(`admin.sock`、起動ユーザーのみアクセス可)経由で実行され、
+即座に反映される。停止中はファイルを直接更新する(次回起動時に反映)。
+sudo でサーバーを動かしている場合は userctl も sudo で実行すること。
 
 **注意**: `userctl passwd` は緊急用のリセットです。E2E 暗号化のため、
 この方法でリセットすると既存の暗号化ファイルは復号できなくなります

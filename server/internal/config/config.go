@@ -32,6 +32,9 @@ type Config struct {
 	// QuotaMB は 1 ユーザーが使える合計容量(MB)。ファイルとメールの両方を含む。
 	// 0 なら 10240 (10GB)。
 	QuotaMB int64 `json:"quota_mb"`
+	// CertCheckMinutes は証明書ファイルを再読み込みする間隔(分)。0 なら 60。
+	// certbot が証明書を更新すると、次の確認時に再起動なしで反映される。
+	CertCheckMinutes int `json:"cert_check_minutes"`
 }
 
 // Default はデフォルト設定を返す。
@@ -69,6 +72,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.QuotaMB <= 0 {
 		cfg.QuotaMB = 10240
+	}
+	if cfg.CertCheckMinutes <= 0 {
+		cfg.CertCheckMinutes = 60
 	}
 	return cfg, nil
 }
