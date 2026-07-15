@@ -51,20 +51,9 @@ go build -o userctl ./cmd/userctl
 ./scripts/gen-cert.sh myserver <サーバーのホスト名またはIP>
 ```
 
-**Let's Encrypt を使う場合(mail.shudo-physics.com 向けの推奨構成)**:
-`/etc/letsencrypt/live/<ドメイン>/privkey.pem` は root しか読めないため、
-certbot の更新フックで `certs/` にコピーする方式を推奨。
-
-```sh
-sudo cp deploy/letsencrypt-deploy-hook.sh /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh
-sudo /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh   # 初回は手動実行
-```
-
-これで `certs/mail.crt` / `certs/mail.key` が配置・自動更新される
-(`cert_name` は `"mail"`)。更新のたびにサービスも自動再起動される。
-
-root でサービスを動かす場合に限り、コピーせず直接参照もできる:
+**Let's Encrypt を使う場合(mail.shudo-physics.com、sudo で起動する構成)**:
+config.example.json は Let's Encrypt の証明書を直接参照する設定になっている。
+`privkey.pem` は root しか読めないため、サーバーは sudo で起動する。
 
 ```json
 {
@@ -72,6 +61,22 @@ root でサービスを動かす場合に限り、コピーせず直接参照も
   "key_file": "/etc/letsencrypt/live/mail.shudo-physics.com/privkey.pem"
 }
 ```
+
+```sh
+sudo ./cloudserver -config config.json
+```
+
+証明書は起動時に一度だけ読み込まれるため、certbot の更新(約 90 日ごと)後は
+サーバーの再起動が必要。忘れないように更新フックを入れておくと楽:
+
+```sh
+echo 'systemctl try-restart cloudservice 2>/dev/null || pkill -x cloudserver' | \
+  sudo tee /etc/letsencrypt/renewal-hooks/deploy/cloudservice-restart.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/cloudservice-restart.sh
+```
+
+(root で動かしたくない場合は `deploy/letsencrypt-deploy-hook.sh` で
+証明書を `certs/` にコピーして一般ユーザーで動かす方式も使える)
 
 ### 3. 設定ファイル
 

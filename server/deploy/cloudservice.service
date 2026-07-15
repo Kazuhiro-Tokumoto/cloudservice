@@ -16,6 +16,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Let's Encrypt の証明書 (/etc/letsencrypt/live/...) を config の cert_file/key_file で
+# 直接参照する場合は root で動かす必要があるため、次の 2 行を root/root に変更する。
 User=cloudservice
 Group=cloudservice
 WorkingDirectory=/opt/cloudservice
