@@ -1,23 +1,23 @@
 // userctl は管理者用の管理 CLI。
-// 身内向けサービスのため、ユーザー登録はサーバー管理者がこのコマンドで行う。
+//
+// 引数なしで起動すると対話型の管理コンソール(CUI)になり、
+// プロンプトにコマンドを打ち込んで操作する。
+// 引数を付ければ 1 コマンドだけ実行して終了する(スクリプト用)。
+//
+//	sudo ./userctl                  # 対話型コンソール
+//	sudo ./userctl add taro pass123 # 1 コマンド実行
 //
 // サーバーが稼働中なら data ディレクトリ内の管理ソケット (admin.sock) 経由で
 // 実行され、サーバーを止めずに即座に反映される。
 // サーバーが停止中ならファイルを直接更新する(次回起動時に反映)。
-//
-// 使い方:
-//
-//	userctl [-data <dataディレクトリ>] add <ユーザー名> <パスワード>     ユーザー追加
-//	userctl [-data <dataディレクトリ>] passwd <ユーザー名> <新パスワード> パスワードリセット
-//	userctl [-data <dataディレクトリ>] del <ユーザー名>                  ユーザー削除
-//	userctl [-data <dataディレクトリ>] list                              ユーザー一覧(使用容量つき)
-//	userctl [-data <dataディレクトリ>] status                            サーバー状態
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/auth"
@@ -34,21 +35,84 @@ import (
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/store"
 )
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `使い方:
-  userctl [-data <dataディレクトリ>] add <ユーザー名> <パスワード>      ユーザー追加
-  userctl [-data <dataディレクトリ>] passwd <ユーザー名> <新パスワード>  パスワードリセット(注意: 対象ユーザーの暗号化データは読めなくなる)
-  userctl [-data <dataディレクトリ>] del <ユーザー名>                   ユーザー削除(ファイルは残る)
-  userctl [-data <dataディレクトリ>] list                               ユーザー一覧(使用容量つき)
-  userctl [-data <dataディレクトリ>] status                             サーバー状態(稼働時間・証明書期限など)
+const helpText = `コマンド一覧:
+  add <ユーザー名> <パスワード>       ユーザーを追加する
+  passwd <ユーザー名> <新パスワード>   パスワードをリセットする(注意: 対象ユーザーの暗号化データは読めなくなる)
+  del <ユーザー名>                    ユーザーを削除する(ファイルは残る)
+  list                                ユーザー一覧(使用容量・鍵登録状況・作成日)
+  status                              サーバー状態(稼働時間・証明書の有効期限など)
+  help                                このヘルプを表示する
+  exit                                コンソールを終了する
+`
 
-サーバー稼働中は管理ソケット経由で即時反映、停止中はファイルを直接更新します。`)
-	os.Exit(2)
+func main() {
+	dataDir := flag.String("data", "data", "data ディレクトリのパス(config.json の data_dir と同じ場所)")
+	flag.Parse()
+	args := flag.Args()
+
+	// 引数なし → 対話型コンソール
+	if len(args) == 0 {
+		runShell(*dataDir)
+		return
+	}
+	// 引数あり → 1 コマンド実行(スクリプト用)
+	if args[0] == "help" {
+		fmt.Print(helpText)
+		return
+	}
+	if err := dispatch(*dataDir, args, true); err != nil {
+		fmt.Fprintln(os.Stderr, "エラー: "+err.Error())
+		os.Exit(1)
+	}
 }
 
-func fatal(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", a...)
-	os.Exit(1)
+// --- 対話型コンソール ---
+
+func runShell(dataDir string) {
+	fmt.Println("クラウドサービス 管理コンソール")
+	fmt.Println("help でコマンド一覧、exit で終了します。")
+	in := bufio.NewScanner(os.Stdin)
+	for {
+		// プロンプトにサーバーの稼働状態を表示する
+		mode := "停止中"
+		if c := adminClient(filepath.Join(dataDir, "admin.sock")); c != nil {
+			mode = "稼働中"
+		}
+		fmt.Printf("cloud[%s]> ", mode)
+		if !in.Scan() {
+			fmt.Println()
+			return
+		}
+		fields := strings.Fields(in.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "exit", "quit":
+			return
+		case "help", "?":
+			fmt.Print(helpText)
+			continue
+		}
+		if err := dispatch(dataDir, fields, false); err != nil {
+			fmt.Println("エラー: " + err.Error())
+		}
+	}
+}
+
+// dispatch はコマンドを実行する。サーバー稼働中は管理ソケット経由、停止中はファイル直接。
+// announce が true のとき、どちらのモードで実行したかを表示する(1 コマンド実行用)。
+func dispatch(dataDir string, args []string, announce bool) error {
+	if c := adminClient(filepath.Join(dataDir, "admin.sock")); c != nil {
+		if announce {
+			fmt.Println("(稼働中のサーバーに接続しました: 即時反映されます)")
+		}
+		return runRemote(c, args)
+	}
+	if announce {
+		fmt.Println("(サーバー停止中: ファイルを直接更新します。次回起動時に反映)")
+	}
+	return runLocal(dataDir, args)
 }
 
 func fmtBytes(n int64) string {
@@ -65,13 +129,14 @@ func fmtBytes(n int64) string {
 	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
-func validate(username, password string) {
+func validate(username, password string) error {
 	if !store.ValidUsername(username) {
-		fatal("ユーザー名は英数字・ハイフン・アンダースコア 1〜32 文字にしてください")
+		return errors.New("ユーザー名は英数字・ハイフン・アンダースコア 1〜32 文字にしてください")
 	}
 	if len(password) < 8 {
-		fatal("パスワードは 8 文字以上にしてください")
+		return errors.New("パスワードは 8 文字以上にしてください")
 	}
+	return nil
 }
 
 func passwdWarning() {
@@ -80,19 +145,11 @@ func passwdWarning() {
 	fmt.Println("データを残したままパスワードを変えるには、Web 画面の「パスワード変更」を使ってください。")
 }
 
-func main() {
-	dataDir := flag.String("data", "data", "data ディレクトリのパス(config.json の data_dir と同じ場所)")
-	flag.Parse()
-	args := flag.Args()
-	if len(args) < 1 {
-		usage()
+func printUserTable(rows [][4]string) {
+	fmt.Printf("%-20s %-12s %-10s %s\n", "ユーザー名", "使用容量", "鍵登録", "作成日")
+	for _, r := range rows {
+		fmt.Printf("%-20s %-12s %-10s %s\n", r[0], r[1], r[2], r[3])
 	}
-
-	if c := adminClient(filepath.Join(*dataDir, "admin.sock")); c != nil {
-		runRemote(c, args)
-		return
-	}
-	runLocal(*dataDir, args)
 }
 
 // --- 稼働中サーバーへの接続(管理ソケット経由) ---
@@ -119,16 +176,19 @@ func adminClient(sock string) *http.Client {
 	return c
 }
 
-func adminCall(c *http.Client, method, path string, body any) map[string]json.RawMessage {
+func adminCall(c *http.Client, method, path string, body any) ([]byte, error) {
 	var reqBody io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		reqBody = bytes.NewReader(b)
 	}
-	req, _ := http.NewRequest(method, "http://cloudservice"+path, reqBody)
+	req, err := http.NewRequest(method, "http://cloudservice"+path, reqBody)
+	if err != nil {
+		return nil, err
+	}
 	res, err := c.Do(req)
 	if err != nil {
-		fatal("サーバーとの通信に失敗: %v", err)
+		return nil, fmt.Errorf("サーバーとの通信に失敗: %w", err)
 	}
 	defer res.Body.Close()
 	data, _ := io.ReadAll(res.Body)
@@ -137,72 +197,84 @@ func adminCall(c *http.Client, method, path string, body any) map[string]json.Ra
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			fatal("%s", e.Error)
+			return nil, errors.New(e.Error)
 		}
-		fatal("サーバーエラー: HTTP %d", res.StatusCode)
+		return nil, fmt.Errorf("サーバーエラー: HTTP %d", res.StatusCode)
 	}
-	var out map[string]json.RawMessage
-	json.Unmarshal(data, &out)
-	// 配列レスポンス用に生データも入れておく
-	if out == nil {
-		out = map[string]json.RawMessage{}
-	}
-	out["_raw"] = data
-	return out
+	return data, nil
 }
 
-func runRemote(c *http.Client, args []string) {
-	fmt.Println("(稼働中のサーバーに接続しました: 即時反映されます)")
+func runRemote(c *http.Client, args []string) error {
 	switch args[0] {
 	case "add":
 		if len(args) != 3 {
-			usage()
+			return errors.New("使い方: add <ユーザー名> <パスワード>")
 		}
-		validate(args[1], args[2])
-		adminCall(c, "POST", "/admin/users", map[string]string{"username": args[1], "password": args[2]})
+		if err := validate(args[1], args[2]); err != nil {
+			return err
+		}
+		if _, err := adminCall(c, "POST", "/admin/users",
+			map[string]string{"username": args[1], "password": args[2]}); err != nil {
+			return err
+		}
 		fmt.Printf("ユーザー %s を追加しました\n", args[1])
 
 	case "passwd":
 		if len(args) != 3 {
-			usage()
+			return errors.New("使い方: passwd <ユーザー名> <新パスワード>")
 		}
-		validate(args[1], args[2])
-		adminCall(c, "POST", "/admin/passwd", map[string]string{"username": args[1], "password": args[2]})
+		if err := validate(args[1], args[2]); err != nil {
+			return err
+		}
+		if _, err := adminCall(c, "POST", "/admin/passwd",
+			map[string]string{"username": args[1], "password": args[2]}); err != nil {
+			return err
+		}
 		fmt.Printf("ユーザー %s のパスワードをリセットしました\n", args[1])
 		passwdWarning()
 
 	case "del":
 		if len(args) != 2 {
-			usage()
+			return errors.New("使い方: del <ユーザー名>")
 		}
-		adminCall(c, "DELETE", "/admin/users/"+args[1], nil)
+		if _, err := adminCall(c, "DELETE", "/admin/users/"+args[1], nil); err != nil {
+			return err
+		}
 		fmt.Printf("ユーザー %s を削除しました(ファイルは残ります)\n", args[1])
 
 	case "list":
-		res := adminCall(c, "GET", "/admin/users", nil)
+		data, err := adminCall(c, "GET", "/admin/users", nil)
+		if err != nil {
+			return err
+		}
 		var users []struct {
 			Username  string    `json:"username"`
 			CreatedAt time.Time `json:"created_at"`
 			HasKeys   bool      `json:"has_keys"`
 			UsedBytes int64     `json:"used_bytes"`
 		}
-		json.Unmarshal(res["_raw"], &users)
+		json.Unmarshal(data, &users)
 		if len(users) == 0 {
 			fmt.Println("ユーザーはいません")
-			return
+			return nil
 		}
-		fmt.Printf("%-20s %-12s %-10s %s\n", "ユーザー名", "使用容量", "鍵登録", "作成日")
+		rows := make([][4]string, 0, len(users))
 		for _, u := range users {
 			keys := "未ログイン"
 			if u.HasKeys {
 				keys = "済み"
 			}
-			fmt.Printf("%-20s %-12s %-10s %s\n",
-				u.Username, fmtBytes(u.UsedBytes), keys, u.CreatedAt.Format("2006-01-02"))
+			rows = append(rows, [4]string{
+				u.Username, fmtBytes(u.UsedBytes), keys, u.CreatedAt.Format("2006-01-02"),
+			})
 		}
+		printUserTable(rows)
 
 	case "status":
-		res := adminCall(c, "GET", "/admin/status", nil)
+		data, err := adminCall(c, "GET", "/admin/status", nil)
+		if err != nil {
+			return err
+		}
 		var st struct {
 			Addr          string    `json:"addr"`
 			HTTPS         bool      `json:"https"`
@@ -211,7 +283,7 @@ func runRemote(c *http.Client, args []string) {
 			UserCount     int       `json:"user_count"`
 			QuotaBytes    int64     `json:"quota_bytes"`
 		}
-		json.Unmarshal(res["_raw"], &st)
+		json.Unmarshal(data, &st)
 		up := time.Duration(st.UptimeSeconds) * time.Second
 		fmt.Printf("サーバー:     稼働中 (%s, 起動から %s)\n", st.Addr, up.Round(time.Second))
 		if st.HTTPS {
@@ -232,55 +304,59 @@ func runRemote(c *http.Client, args []string) {
 		fmt.Printf("容量上限:     %s / ユーザー\n", fmtBytes(st.QuotaBytes))
 
 	default:
-		usage()
+		return fmt.Errorf("不明なコマンド %q です(help で一覧を表示)", args[0])
 	}
+	return nil
 }
 
 // --- サーバー停止中: ファイルを直接更新 ---
 
-func runLocal(dataDir string, args []string) {
-	fmt.Println("(サーバー停止中: ファイルを直接更新します。次回起動時に反映)")
+func runLocal(dataDir string, args []string) error {
 	st, err := store.Open(dataDir)
 	if err != nil {
-		fatal("ストアを開けません: %v", err)
+		return fmt.Errorf("ストアを開けません: %w", err)
 	}
 
 	switch args[0] {
 	case "add":
 		if len(args) != 3 {
-			usage()
+			return errors.New("使い方: add <ユーザー名> <パスワード>")
 		}
-		validate(args[1], args[2])
+		if err := validate(args[1], args[2]); err != nil {
+			return err
+		}
 		hash, err := auth.HashAuthKey(auth.DeriveAuthKey(args[1], args[2]))
 		if err != nil {
-			fatal("ハッシュ化に失敗: %v", err)
+			return err
 		}
 		if err := st.AddUser(store.User{Username: args[1], AuthKeyHash: hash, CreatedAt: time.Now()}); err != nil {
-			fatal("%v", err)
+			return err
 		}
 		fmt.Printf("ユーザー %s を追加しました\n", args[1])
 
 	case "passwd":
 		if len(args) != 3 {
-			usage()
+			return errors.New("使い方: passwd <ユーザー名> <新パスワード>")
 		}
-		validate(args[1], args[2])
+		if err := validate(args[1], args[2]); err != nil {
+			return err
+		}
 		hash, err := auth.HashAuthKey(auth.DeriveAuthKey(args[1], args[2]))
 		if err != nil {
-			fatal("ハッシュ化に失敗: %v", err)
+			return err
 		}
 		if err := st.SetAuthKeyHash(args[1], hash); err != nil {
-			fatal("%v", err)
+			return err
 		}
 		fmt.Printf("ユーザー %s のパスワードをリセットしました\n", args[1])
 		passwdWarning()
 
 	case "del":
 		if len(args) != 2 {
-			usage()
+			return errors.New("使い方: del <ユーザー名>")
 		}
 		if err := st.DeleteUser(args[1]); err != nil {
-			fatal("%v", err)
+			return err
 		}
 		fmt.Printf("ユーザー %s を削除しました(ファイルは残ります)\n", args[1])
 
@@ -291,9 +367,9 @@ func runLocal(dataDir string, args []string) {
 		sort.Slice(users, func(i, j int) bool { return users[i].Username < users[j].Username })
 		if len(users) == 0 {
 			fmt.Println("ユーザーはいません")
-			return
+			return nil
 		}
-		fmt.Printf("%-20s %-12s %-10s %s\n", "ユーザー名", "使用容量", "鍵登録", "作成日")
+		rows := make([][4]string, 0, len(users))
 		for _, u := range users {
 			var used int64
 			if root != nil {
@@ -307,15 +383,18 @@ func runLocal(dataDir string, args []string) {
 			if len(u.KeyBundle) > 0 {
 				keys = "済み"
 			}
-			fmt.Printf("%-20s %-12s %-10s %s\n",
-				u.Username, fmtBytes(used), keys, u.CreatedAt.Format("2006-01-02"))
+			rows = append(rows, [4]string{
+				u.Username, fmtBytes(used), keys, u.CreatedAt.Format("2006-01-02"),
+			})
 		}
+		printUserTable(rows)
 
 	case "status":
 		fmt.Println("サーバー:     停止中(管理ソケットに接続できません)")
 		fmt.Printf("ユーザー数:   %d\n", len(st.ListUsers()))
 
 	default:
-		usage()
+		return fmt.Errorf("不明なコマンド %q です(help で一覧を表示)", args[0])
 	}
+	return nil
 }
