@@ -23,6 +23,9 @@
   - 特定ユーザーへの共有: ファイル鍵を相手の公開鍵で包み直す(相手だけが復号可能)
   - 共有リンク: 復号鍵を URL の `#` 以降に載せる(フラグメントはサーバーに
     送信されないため、リンクを知っている人だけが復号できる)
+- **内部メール**: ユーザー名を宛先にしたメール(件名・本文とも E2E 暗号化、返信対応)
+- **保存容量は 1 人 10GB**(`quota_mb` で変更可)。Google と同様に
+  ファイルとメールの合計で計算され、画面に使用量バーが表示される
 - パスワード変更は Web 画面から(マスター鍵は変わらないので既存ファイルはそのまま)
 - 通信は HTTPS(TLS)。証明書は `server/certs/` フォルダに置き、名前を指定するだけ。
 - ユーザー登録は管理者が `userctl` コマンドで行う(勝手に登録できない)
@@ -48,8 +51,27 @@ go build -o userctl ./cmd/userctl
 ./scripts/gen-cert.sh myserver <サーバーのホスト名またはIP>
 ```
 
-Let's Encrypt 等の証明書を使う場合は `fullchain.pem` → `<名前>.crt`、
-`privkey.pem` → `<名前>.key` としてコピーする。
+**Let's Encrypt を使う場合(mail.shudo-physics.com 向けの推奨構成)**:
+`/etc/letsencrypt/live/<ドメイン>/privkey.pem` は root しか読めないため、
+certbot の更新フックで `certs/` にコピーする方式を推奨。
+
+```sh
+sudo cp deploy/letsencrypt-deploy-hook.sh /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh
+sudo /etc/letsencrypt/renewal-hooks/deploy/cloudservice.sh   # 初回は手動実行
+```
+
+これで `certs/mail.crt` / `certs/mail.key` が配置・自動更新される
+(`cert_name` は `"mail"`)。更新のたびにサービスも自動再起動される。
+
+root でサービスを動かす場合に限り、コピーせず直接参照もできる:
+
+```json
+{
+  "cert_file": "/etc/letsencrypt/live/mail.shudo-physics.com/fullchain.pem",
+  "key_file": "/etc/letsencrypt/live/mail.shudo-physics.com/privkey.pem"
+}
+```
 
 ### 3. 設定ファイル
 
@@ -59,17 +81,22 @@ cp config.example.json config.json
 
 ```json
 {
-  "addr": ":8443",
+  "addr": ":40000",
   "cert_dir": "certs",
-  "cert_name": "myserver",
+  "cert_name": "mail",
   "data_dir": "data",
   "web_dir": "web",
   "session_hours": 24,
-  "max_upload_mb": 1024
+  "max_upload_mb": 1024,
+  "quota_mb": 10240
 }
 ```
 
 `cert_name` に証明書の名前(拡張子なし)を入れると HTTPS で起動する。
+`addr: ":40000"` で待ち受けるので、DNS で mail.shudo-physics.com を
+このサーバーの IP に向け、ファイアウォールで TCP 40000 を開けておくこと。
+ブラウザからは `https://mail.shudo-physics.com:40000/` でアクセスする
+(Web クライアントも同じサーバーが配信するので、これ 1 つで完結)。
 
 ### 4. ユーザーを作る(管理者のみ)
 
@@ -142,6 +169,11 @@ HTTPS のサーバーに向ける場合は `API_TARGET=https://localhost:8443 np
 | GET | `/api/shared/download?id=` | 自分宛共有のダウンロード(暗号化ブロブ) |
 | GET | `/api/public/share/{token}` | リンク共有のブロブ取得(認証不要) |
 | GET | `/s/{token}#k=<鍵>` | 共有リンクの閲覧ページ(ブラウザ内で復号) |
+| GET | `/api/quota` | 使用容量と上限(ファイル + メール) |
+| POST | `/api/mail` | メール送信(暗号化済み件名・本文 + 包んだ鍵×2) |
+| GET | `/api/mail?folder=inbox\|sent` | メール一覧(本文なし) |
+| GET | `/api/mail/{id}` | メール 1 通(本文込み) |
+| DELETE | `/api/mail/{id}` | メール削除 |
 
 `/api/*` は `Authorization: Bearer <トークン>` が必要(login と public/share を除く)。
 
@@ -161,6 +193,8 @@ HTTPS のサーバーに向ける場合は `API_TARGET=https://localhost:8443 np
           ファイル鍵はマスター鍵で包んでファイル先頭に埋め込む。
 共有(ユーザー): ファイル鍵を相手の公開鍵で包み直す(ECDH + HKDF + AES-GCM)
 共有(リンク):   ファイル鍵を URL のフラグメント(#k=)に載せる
+メール:          1 通ごとのメール鍵で件名・本文を暗号化。
+                 メール鍵は宛先の公開鍵(受信箱用)と自分の公開鍵(送信済み用)で包む
 ```
 
 - サーバーが保存するのは暗号文・bcrypt ハッシュ・暗号化済み鍵バンドルのみ。

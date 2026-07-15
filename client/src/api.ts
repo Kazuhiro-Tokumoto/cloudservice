@@ -25,6 +25,23 @@ export interface KeyBundle {
   enc_master_key: string;
 }
 
+export interface MailMessage {
+  id: string;
+  folder: "inbox" | "sent";
+  from: string;
+  to: string;
+  created_at: string;
+  enc_subject: string;
+  enc_body?: string;
+  wrapped_key: string;
+  size?: number;
+}
+
+export interface Quota {
+  used: number;
+  limit: number;
+}
+
 export interface ShareList {
   mine: Share[];
   received: Share[];
@@ -199,6 +216,41 @@ export async function deleteShare(id: string): Promise<void> {
 export async function downloadShared(id: string): Promise<Uint8Array> {
   const res = await request(`/api/shared/download?id=${encodeURIComponent(id)}`);
   return new Uint8Array(await res.arrayBuffer());
+}
+
+// --- メール ---
+
+export async function sendMail(payload: {
+  to: string;
+  enc_subject: string;
+  enc_body: string;
+  wrapped_key_to: string;
+  wrapped_key_self: string;
+}): Promise<void> {
+  await request("/api/mail", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listMail(folder: "inbox" | "sent"): Promise<MailMessage[]> {
+  const res = await request(`/api/mail?folder=${folder}`);
+  return res.json();
+}
+
+export async function getMail(id: string): Promise<MailMessage> {
+  const res = await request(`/api/mail/${encodeURIComponent(id)}`);
+  return res.json();
+}
+
+export async function deleteMail(id: string): Promise<void> {
+  await request(`/api/mail/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function getQuota(): Promise<Quota> {
+  const res = await request("/api/quota");
+  return res.json();
 }
 
 // リンク共有のブロブ取得(認証不要)。ファイル名は Content-Disposition から取る。

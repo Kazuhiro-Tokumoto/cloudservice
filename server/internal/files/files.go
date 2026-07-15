@@ -5,6 +5,7 @@ package files
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -189,4 +190,24 @@ func (r *Root) Stat(username, rel string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return os.Stat(abs)
+}
+
+// Usage はユーザーのホーム配下の合計サイズ(バイト)を返す。容量制限の計算用。
+func (r *Root) Usage(username string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(filepath.Join(r.dir, username), func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			if info, e := d.Info(); e == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	return total, err
 }

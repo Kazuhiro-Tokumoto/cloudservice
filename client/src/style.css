@@ -180,6 +180,74 @@ header.topbar h1 {
   font-size: 0.8rem;
 }
 
+/* タブ */
+nav.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+nav.tabs button {
+  border: none;
+  background: none;
+  border-radius: 0;
+  padding: 10px 16px;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+nav.tabs button:hover {
+  color: var(--text);
+  background: none;
+}
+
+nav.tabs button.active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+/* 使用容量 */
+.spacer {
+  flex: 1;
+}
+
+.quota {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.quota .bar {
+  width: 140px;
+  height: 6px;
+  background: #f1f1f1;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.quota .bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* メール本文 */
+.mail-body {
+  font-family: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid var(--border);
+  margin: 12px 0 0;
+  padding: 12px 0 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
 /* 本文 */
 main {
   max-width: 920px;

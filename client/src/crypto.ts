@@ -283,6 +283,42 @@ async function decryptBody(fileKeyRaw: Uint8Array, rest: Uint8Array): Promise<Ui
   return aesDecrypt(fileKey, rest);
 }
 
+// --- メール用: 生鍵での小さなデータの暗号化/復号 ---
+// メールは 1 通ごとにランダムなメール鍵を作り、件名と本文を個別に暗号化する。
+// メール鍵は宛先の公開鍵(受信箱用)と自分の公開鍵(送信済み用)でそれぞれ包む。
+
+export function newRawKey(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(32));
+}
+
+export async function encryptBytesWithRawKey(
+  rawKey: Uint8Array,
+  data: Uint8Array,
+): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    rawKey as BufferSource,
+    "AES-GCM",
+    false,
+    ["encrypt"],
+  );
+  return toB64(await aesEncrypt(key, data));
+}
+
+export async function decryptBytesWithRawKey(
+  rawKey: Uint8Array,
+  b64: string,
+): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    rawKey as BufferSource,
+    "AES-GCM",
+    false,
+    ["decrypt"],
+  );
+  return aesDecrypt(key, fromB64(b64));
+}
+
 // --- ユーザー共有のための鍵の包み直し (ECIES: ECDH + HKDF + AES-GCM) ---
 //
 // 形式: 送信側の一時公開鍵 (raw 65B) || iv12 || 包んだファイル鍵

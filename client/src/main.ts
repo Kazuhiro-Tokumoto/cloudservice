@@ -5,11 +5,14 @@ import * as api from "./api";
 import {
   BLOB_OVERHEAD,
   createKeyBundle,
+  decryptBytesWithRawKey,
   decryptFileWithMaster,
   decryptFileWithRawKey,
   deriveKeys,
+  encryptBytesWithRawKey,
   encryptFile,
   fromB64Url,
+  newRawKey,
   openKeyBundle,
   rewrapKeyBundle,
   toB64Url,
@@ -42,8 +45,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
-function fmtSize(encryptedSize: number): string {
-  const n = Math.max(0, encryptedSize - BLOB_OVERHEAD);
+function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
@@ -53,6 +55,10 @@ function fmtSize(encryptedSize: number): string {
     i++;
   }
   return `${v.toFixed(1)} ${units[i]}`;
+}
+
+function fmtSize(encryptedSize: number): string {
+  return fmtBytes(Math.max(0, encryptedSize - BLOB_OVERHEAD));
 }
 
 function fmtDate(iso: string): string {
@@ -205,6 +211,29 @@ async function renderMain(): Promise<void> {
     renderLogin();
   };
 
+  // タブ: ファイル / メール / 共有
+  const tabs: { id: string; label: string; refresh: () => Promise<void> }[] = [
+    { id: "files-panel", label: "ファイル", refresh: refreshFiles },
+    { id: "mail-panel", label: "メール", refresh: refreshMail },
+    { id: "shares-panel", label: "共有", refresh: refreshShares },
+  ];
+  const nav = el("nav", { class: "tabs" });
+  const showTab = (id: string) => {
+    for (const t of tabs) {
+      document.getElementById(t.id)!.hidden = t.id !== id;
+    }
+    nav.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tab === id);
+    });
+    const tab = tabs.find((t) => t.id === id)!;
+    run(tab.refresh);
+  };
+  for (const t of tabs) {
+    const btn = el("button", { "data-tab": t.id }, t.label);
+    btn.onclick = () => showTab(t.id);
+    nav.append(btn);
+  }
+
   app.replaceChildren(
     el(
       "header",
@@ -219,22 +248,36 @@ async function renderMain(): Promise<void> {
         logoutBtn,
       ),
     ),
+    nav,
     el(
       "main",
       {},
       errorBanner,
       el("section", { class: "panel", id: "files-panel" }),
+      el("section", { class: "panel", id: "mail-panel" }),
       el("section", { class: "panel", id: "shares-panel" }),
     ),
   );
-
-  await run(refreshFiles);
-  await run(refreshShares);
+  showTab("files-panel");
 }
 
 async function refreshFiles(): Promise<void> {
   const panel = document.getElementById("files-panel")!;
-  const entries = await api.listFiles(currentPath);
+  const [entries, quota] = await Promise.all([
+    api.listFiles(currentPath),
+    api.getQuota(),
+  ]);
+
+  // 使用容量(ファイル + メールで 10GB まで)
+  const pct = Math.min(100, (quota.used / quota.limit) * 100);
+  const bar = el("span");
+  bar.style.width = `${pct}%`;
+  const quotaBox = el(
+    "div",
+    { class: "quota", title: "ファイルとメールの合計" },
+    el("div", { class: "bar" }, bar),
+    `${fmtBytes(quota.used)} / ${fmtBytes(quota.limit)} 使用中`,
+  );
 
   // パンくずリスト
   const crumbs = el("div", { class: "breadcrumb" });
@@ -377,6 +420,8 @@ async function refreshFiles(): Promise<void> {
       mkdirBtn,
       newFileBtn,
       refreshBtn,
+      el("span", { class: "spacer" }),
+      quotaBox,
       fileInput,
     ),
     crumbs,
@@ -595,6 +640,204 @@ async function refreshShares(): Promise<void> {
         "リンクを共有した時点の URL 全体を相手に渡してください(共有一覧からは再取得できません)。",
     ),
   );
+}
+
+// --- メール(件名・本文とも E2E 暗号化) ---
+
+// 一覧表示用: 自分宛に包まれたメール鍵を解いて件名を復号する
+async function decryptSubject(m: api.MailMessage): Promise<string> {
+  try {
+    const mailKey = await unwrapKeyFromUser(userKeys!.privateKey, m.wrapped_key);
+    return new TextDecoder().decode(
+      await decryptBytesWithRawKey(mailKey, m.enc_subject),
+    );
+  } catch {
+    return "(復号できません)";
+  }
+}
+
+async function refreshMail(): Promise<void> {
+  const panel = document.getElementById("mail-panel")!;
+  const [inbox, sent] = await Promise.all([
+    api.listMail("inbox"),
+    api.listMail("sent"),
+  ]);
+
+  const composeBtn = el("button", { class: "primary" }, "新規メール");
+  composeBtn.onclick = () => run(() => openComposeDialog());
+  const refreshBtn = el("button", {}, "更新");
+  refreshBtn.onclick = () => run(refreshMail);
+
+  const makeTable = async (
+    msgs: api.MailMessage[],
+    who: (m: api.MailMessage) => string,
+  ) => {
+    const tbody = el("tbody");
+    for (const m of msgs) {
+      const subject = await decryptSubject(m);
+      const subjectCell = el("td", { class: "name-cell" }, subject || "(件名なし)");
+      subjectCell.onclick = () => run(() => openMailView(m.id));
+      const del = el("button", { class: "link danger" }, "削除");
+      del.onclick = () => {
+        if (!confirm(`「${subject}」を削除しますか?`)) return;
+        run(async () => {
+          await api.deleteMail(m.id);
+          await refreshMail();
+        });
+      };
+      tbody.append(
+        el(
+          "tr",
+          {},
+          subjectCell,
+          el("td", { class: "muted" }, who(m)),
+          el("td", { class: "muted" }, fmtDate(m.created_at)),
+          el("td", { class: "actions" }, del),
+        ),
+      );
+    }
+    return el(
+      "table",
+      {},
+      el(
+        "thead",
+        {},
+        el(
+          "tr",
+          {},
+          el("th", {}, "件名"),
+          el("th", {}, ""),
+          el("th", {}, "日時"),
+          el("th", {}, ""),
+        ),
+      ),
+      tbody,
+    );
+  };
+
+  panel.replaceChildren(
+    el("h2", {}, "メール"),
+    el("div", { class: "toolbar" }, composeBtn, refreshBtn),
+    el("h3", {}, "受信箱"),
+    inbox.length
+      ? await makeTable(inbox, (m) => `${m.from} さんから`)
+      : el("div", { class: "empty" }, "受信メールはありません"),
+    el("h3", {}, "送信済み"),
+    sent.length
+      ? await makeTable(sent, (m) => `${m.to} さんへ`)
+      : el("div", { class: "empty" }, "送信済みメールはありません"),
+    el(
+      "div",
+      { class: "note" },
+      "メールは件名・本文ともブラウザ内で暗号化され、宛先の人だけが読めます。" +
+        "メールも保存容量(ファイルと合わせて 10GB)に含まれます。",
+    ),
+  );
+}
+
+async function openComposeDialog(
+  prefTo = "",
+  prefSubject = "",
+): Promise<void> {
+  const users = (await api.listUsers()).filter((u) => u !== currentUser);
+
+  const dialog = el("dialog");
+  const toSelect = el("select");
+  for (const u of users) {
+    toSelect.append(el("option", { value: u }, u));
+  }
+  if (prefTo) toSelect.value = prefTo;
+  const subject = el("input", { type: "text", placeholder: "件名" });
+  subject.value = prefSubject;
+  const body = el("textarea", { rows: "10", placeholder: "本文" });
+  const msg = el("div", { class: "note" });
+
+  const sendBtn = el("button", { class: "primary", type: "button" }, "送信");
+  sendBtn.onclick = async () => {
+    if (!toSelect.value) {
+      msg.textContent = "宛先を選んでください";
+      return;
+    }
+    sendBtn.disabled = true;
+    msg.textContent = "暗号化して送信しています…";
+    try {
+      const te = new TextEncoder();
+      const mailKey = newRawKey();
+      const [encSubject, encBody, toPub] = await Promise.all([
+        encryptBytesWithRawKey(mailKey, te.encode(subject.value)),
+        encryptBytesWithRawKey(mailKey, te.encode(body.value)),
+        api.getUserPublicKey(toSelect.value),
+      ]);
+      await api.sendMail({
+        to: toSelect.value,
+        enc_subject: encSubject,
+        enc_body: encBody,
+        // 宛先が読めるように相手の公開鍵で、自分も送信済みを読めるように自分の公開鍵で包む
+        wrapped_key_to: await wrapKeyForUser(mailKey, toPub),
+        wrapped_key_self: await wrapKeyForUser(mailKey, userKeys!.publicKeySpki),
+      });
+      closeDialog(dialog);
+      await refreshMail();
+    } catch (e) {
+      msg.textContent = e instanceof Error ? e.message : String(e);
+      sendBtn.disabled = false;
+    }
+  };
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = () => closeDialog(dialog);
+
+  dialog.append(
+    el("h2", {}, "新規メール"),
+    el("label", {}, "宛先: ", toSelect),
+    subject,
+    body,
+    el("div", { class: "toolbar" }, sendBtn, closeBtn),
+    msg,
+  );
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+async function openMailView(id: string): Promise<void> {
+  const m = await api.getMail(id);
+  const mailKey = await unwrapKeyFromUser(userKeys!.privateKey, m.wrapped_key);
+  const td = new TextDecoder();
+  const subject = td.decode(await decryptBytesWithRawKey(mailKey, m.enc_subject));
+  const body = td.decode(await decryptBytesWithRawKey(mailKey, m.enc_body ?? ""));
+
+  const dialog = el("dialog", { class: "wide" });
+  const pre = el("pre", { class: "mail-body" }, body);
+
+  const buttons = el("div", { class: "toolbar" });
+  if (m.folder === "inbox") {
+    const replyBtn = el("button", { type: "button" }, "返信");
+    replyBtn.onclick = () => {
+      closeDialog(dialog);
+      run(() =>
+        openComposeDialog(
+          m.from,
+          subject.startsWith("Re:") ? subject : `Re: ${subject}`,
+        ),
+      );
+    };
+    buttons.append(replyBtn);
+  }
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = () => closeDialog(dialog);
+  buttons.append(closeBtn);
+
+  dialog.append(
+    el("h2", {}, subject || "(件名なし)"),
+    el(
+      "div",
+      { class: "note" },
+      `${m.from} さんから ${m.to} さんへ · ${fmtDate(m.created_at)}`,
+    ),
+    pre,
+    buttons,
+  );
+  document.body.append(dialog);
+  dialog.showModal();
 }
 
 // --- パスワード変更(マスター鍵は変わらないので既存ファイルはそのまま読める) ---

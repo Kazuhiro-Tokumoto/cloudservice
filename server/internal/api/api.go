@@ -16,6 +16,7 @@ import (
 
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/auth"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/files"
+	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/mail"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/store"
 )
 
@@ -23,10 +24,18 @@ import (
 type Server struct {
 	Store      *store.Store
 	Files      *files.Root
+	Mail       *mail.Store
 	Signer     *auth.TokenSigner
 	SessionTTL time.Duration
 	MaxUpload  int64  // バイト
+	Quota      int64  // 1 ユーザーの合計容量(バイト)。ファイル + メール
 	WebDir     string // ビルド済みクライアントの配信ディレクトリ(空なら配信しない)
+}
+
+// usage はユーザーの現在の使用容量(ファイル + メール)を返す。
+func (s *Server) usage(username string) int64 {
+	fu, _ := s.Files.Usage(username)
+	return fu + s.Mail.Usage(username)
 }
 
 // Handler はルーティング済みの http.Handler を返す。
@@ -54,6 +63,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/shares", s.authed(s.handleCreateShare))
 	mux.Handle("DELETE /api/shares/{id}", s.authed(s.handleDeleteShare))
 	mux.Handle("GET /api/shared/download", s.authed(s.handleSharedDownload))
+	mux.Handle("GET /api/quota", s.authed(s.handleQuota))
+	mux.Handle("POST /api/mail", s.authed(s.handleSendMail))
+	mux.Handle("GET /api/mail", s.authed(s.handleListMail))
+	mux.Handle("GET /api/mail/{id}", s.authed(s.handleGetMail))
+	mux.Handle("DELETE /api/mail/{id}", s.authed(s.handleDeleteMail))
 
 	// 静的配信(Web クライアント)
 	if s.WebDir != "" {
@@ -298,12 +312,32 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, username
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, username string) {
 	rel := r.URL.Query().Get("path")
-	body := http.MaxBytesReader(w, r.Body, s.MaxUpload)
+
+	// クォータ確認。同名ファイルの上書きは旧サイズ分を差し引いて計算する。
+	remaining := s.Quota - s.usage(username)
+	if info, err := s.Files.Stat(username, rel); err == nil && !info.IsDir() {
+		remaining += info.Size()
+	}
+	if remaining <= 0 {
+		writeErr(w, http.StatusRequestEntityTooLarge, "保存容量を使い切っています。不要なファイルやメールを削除してください")
+		return
+	}
+	limit := s.MaxUpload
+	quotaLimited := remaining < limit
+	if quotaLimited {
+		limit = remaining
+	}
+
+	body := http.MaxBytesReader(w, r.Body, limit)
 	n, err := s.Files.Write(username, rel, body)
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "ファイルサイズが上限を超えています")
+			if quotaLimited {
+				writeErr(w, http.StatusRequestEntityTooLarge, "保存容量が不足しています。不要なファイルやメールを削除してください")
+			} else {
+				writeErr(w, http.StatusRequestEntityTooLarge, "ファイルサイズが上限を超えています")
+			}
 			return
 		}
 		fileError(w, err)
@@ -438,6 +472,118 @@ func (s *Server) handleSharedDownload(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 	serveFile(w, r, f, info.Name(), info.Size(), 0)
+}
+
+// --- クォータ ---
+
+func (s *Server) handleQuota(w http.ResponseWriter, _ *http.Request, username string) {
+	writeJSON(w, http.StatusOK, map[string]int64{
+		"used":  s.usage(username),
+		"limit": s.Quota,
+	})
+}
+
+// --- メール(件名・本文とも E2E 暗号化。サーバーは暗号文と宛先しか知らない) ---
+
+const maxMailSize = 2 * 1024 * 1024
+
+func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username string) {
+	var req struct {
+		To         string `json:"to"`
+		EncSubject string `json:"enc_subject"`
+		EncBody    string `json:"enc_body"`
+		// メール鍵を宛先の公開鍵で包んだもの / 自分の公開鍵で包んだもの(送信済み用)
+		WrappedKeyTo   string `json:"wrapped_key_to"`
+		WrappedKeySelf string `json:"wrapped_key_self"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxMailSize)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
+		return
+	}
+	if req.To == "" || req.EncSubject == "" || req.EncBody == "" ||
+		req.WrappedKeyTo == "" || req.WrappedKeySelf == "" {
+		writeErr(w, http.StatusBadRequest, "宛先・件名・本文・包んだ鍵がすべて必要です")
+		return
+	}
+	if req.To == username {
+		writeErr(w, http.StatusBadRequest, "自分自身には送れません")
+		return
+	}
+	if _, ok := s.Store.GetUser(req.To); !ok {
+		writeErr(w, http.StatusBadRequest, "宛先ユーザーが存在しません")
+		return
+	}
+
+	// メールも保存容量(10GB)に含める。受信者・送信者の両方を確認する。
+	size := int64(len(req.EncSubject) + len(req.EncBody) + len(req.WrappedKeyTo))
+	if s.usage(req.To)+size > s.Quota {
+		writeErr(w, http.StatusRequestEntityTooLarge, "宛先ユーザーの保存容量が不足しています")
+		return
+	}
+	if s.usage(username)+size > s.Quota {
+		writeErr(w, http.StatusRequestEntityTooLarge, "保存容量が不足しています。不要なファイルやメールを削除してください")
+		return
+	}
+
+	id, err := auth.NewShareToken()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	now := time.Now()
+	base := mail.Message{
+		ID:         id,
+		From:       username,
+		To:         req.To,
+		CreatedAt:  now,
+		EncSubject: req.EncSubject,
+		EncBody:    req.EncBody,
+	}
+	inbox := base
+	inbox.Folder = "inbox"
+	inbox.WrappedKey = req.WrappedKeyTo
+	sent := base
+	sent.Folder = "sent"
+	sent.WrappedKey = req.WrappedKeySelf
+	if err := s.Mail.Save(req.To, inbox); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.Mail.Save(username, sent); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (s *Server) handleListMail(w http.ResponseWriter, r *http.Request, username string) {
+	folder := r.URL.Query().Get("folder")
+	if folder != "sent" {
+		folder = "inbox"
+	}
+	msgs, err := s.Mail.List(username, folder)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, msgs)
+}
+
+func (s *Server) handleGetMail(w http.ResponseWriter, r *http.Request, username string) {
+	m, err := s.Mail.Get(username, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (s *Server) handleDeleteMail(w http.ResponseWriter, r *http.Request, username string) {
+	if err := s.Mail.Delete(username, r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 // handlePublicShare はリンク共有の暗号化ブロブを返す(認証不要)。

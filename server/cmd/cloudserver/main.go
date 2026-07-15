@@ -20,6 +20,7 @@ import (
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/auth"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/config"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/files"
+	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/mail"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/store"
 )
 
@@ -40,6 +41,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("ファイルルートの初期化に失敗: %v", err)
 	}
+	mailStore, err := mail.NewStore(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("メールストアの初期化に失敗: %v", err)
+	}
 	signer, err := auth.LoadOrCreateSigner(cfg.DataDir)
 	if err != nil {
 		log.Fatalf("セッション鍵の初期化に失敗: %v", err)
@@ -48,9 +53,11 @@ func main() {
 	srv := &api.Server{
 		Store:      st,
 		Files:      root,
+		Mail:       mailStore,
 		Signer:     signer,
 		SessionTTL: time.Duration(cfg.SessionHours) * time.Hour,
 		MaxUpload:  cfg.MaxUploadMB * 1024 * 1024,
+		Quota:      cfg.QuotaMB * 1024 * 1024,
 		WebDir:     cfg.WebDir,
 	}
 
@@ -63,10 +70,12 @@ func main() {
 	if certFile, keyFile, ok := cfg.CertFiles(); ok {
 		for _, f := range []string{certFile, keyFile} {
 			if _, err := os.Stat(f); err != nil {
-				log.Fatalf("証明書ファイルが見つかりません: %s\n"+
-					"証明書フォルダ %q に %s.crt と %s.key を置いてください。\n"+
-					"自己署名証明書は scripts/gen-cert.sh で作成できます。",
-					f, cfg.CertDir, cfg.CertName, cfg.CertName)
+				log.Fatalf("証明書ファイルを読めません: %s (%v)\n"+
+					"cert_dir/cert_name 方式なら証明書フォルダに <名前>.crt と <名前>.key を置いてください"+
+					"(自己署名は scripts/gen-cert.sh で作成可)。\n"+
+					"cert_file/key_file 方式ならパスと読み取り権限を確認してください"+
+					"(Let's Encrypt の privkey.pem は root 以外読めないことが多いので、"+
+					"deploy/letsencrypt-deploy-hook.sh でのコピー運用を推奨)。", f, err)
 			}
 		}
 		log.Printf("HTTPS サーバーを %s で起動します (証明書: %s)", cfg.Addr, certFile)
