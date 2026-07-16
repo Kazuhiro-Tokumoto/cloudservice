@@ -396,6 +396,8 @@ async function refreshFiles(): Promise<void> {
         run(refreshFiles);
       } else if (isTextFile(entry.name) && entry.size < 1024 * 1024) {
         run(() => openEditor(entry.path));
+      } else if (previewKind(entry.name)) {
+        run(() => openPreview(entry.path, entry.name));
       } else {
         run(async () => downloadAndSave(entry.path, entry.name));
       }
@@ -409,6 +411,21 @@ async function refreshFiles(): Promise<void> {
       share.onclick = () => run(() => openShareDialog(entry.path));
       actions.append(dl, share);
     }
+    const ren = el("button", { class: "link" }, "名前変更");
+    ren.onclick = () => {
+      const newName = prompt("新しい名前を入力してください", entry.name);
+      if (!newName || newName === entry.name) return;
+      if (newName.includes("/") || newName.includes("\\")) {
+        showError("名前に / は使えません");
+        return;
+      }
+      run(async () => {
+        const dir = entry.path.slice(0, entry.path.length - entry.name.length);
+        await api.renameFile(entry.path, dir + newName);
+        await refreshFiles();
+      });
+    };
+    actions.append(ren);
     const del = el("button", { class: "link danger" }, "削除");
     del.onclick = () => {
       if (!confirm(`「${entry.name}」を削除しますか?`)) return;
@@ -496,6 +513,94 @@ function isTextFile(name: string): boolean {
   return /\.(txt|md|json|csv|log|yaml|yml|xml|html|css|js|ts|go|py|sh|conf|ini)$/i.test(
     name,
   );
+}
+
+// --- プレビュー(画像・PDF・動画・音声をブラウザ内で復号して表示) ---
+
+const MIME_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  avif: "image/avif",
+  pdf: "application/pdf",
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  m4a: "audio/mp4",
+  flac: "audio/flac",
+};
+
+function previewKind(name: string): "image" | "pdf" | "video" | "audio" | null {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const mime = MIME_TYPES[ext];
+  if (!mime) return null;
+  if (mime.startsWith("image/")) return "image";
+  if (mime === "application/pdf") return "pdf";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return null;
+}
+
+async function openPreview(path: string, name: string): Promise<void> {
+  const blob = await api.downloadFile(path);
+  const data = await decryptFileWithMaster(userKeys!.masterKey, blob);
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const url = URL.createObjectURL(
+    new Blob([data as BufferSource], { type: MIME_TYPES[ext] ?? "application/octet-stream" }),
+  );
+
+  let content: HTMLElement;
+  switch (previewKind(name)) {
+    case "image":
+      content = el("img", { src: url, alt: name });
+      break;
+    case "pdf":
+      content = el("iframe", { src: url, title: name });
+      break;
+    case "video": {
+      const v = el("video", { src: url });
+      v.controls = true;
+      content = v;
+      break;
+    }
+    case "audio": {
+      const a = el("audio", { src: url });
+      a.controls = true;
+      content = a;
+      break;
+    }
+    default:
+      URL.revokeObjectURL(url);
+      saveBytes(data, name);
+      return;
+  }
+
+  const dialog = el("dialog", { class: "wide preview" });
+  const close = () => {
+    URL.revokeObjectURL(url);
+    closeDialog(dialog);
+  };
+  const dlBtn = el("button", { type: "button" }, "ダウンロード");
+  dlBtn.onclick = () => saveBytes(data, name);
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = close;
+  dialog.onclose = () => URL.revokeObjectURL(url);
+
+  dialog.append(
+    el("h2", {}, name),
+    el("div", { class: "preview-box" }, content),
+    el("div", { class: "toolbar" }, dlBtn, closeBtn),
+  );
+  document.body.append(dialog);
+  dialog.showModal();
 }
 
 // --- テキストエディタ ---
@@ -723,12 +828,38 @@ async function refreshMail(): Promise<void> {
   const refreshBtn = el("button", {}, "更新");
   refreshBtn.onclick = () => run(refreshMail);
 
+  // 一括選択(受信箱・送信済みをまたいで選択できる)
+  const selected = new Set<string>();
+  const bulkCount = el("span", { class: "bulk-count" });
+  const bulkDelBtn = el("button", { class: "danger-btn" }, "一括削除");
+  const updateBulk = () => {
+    bulkDelBtn.disabled = selected.size === 0;
+    bulkCount.textContent = selected.size ? `${selected.size} 件選択中` : "";
+  };
+  bulkDelBtn.onclick = () => {
+    if (!confirm(`選択した ${selected.size} 件のメールを削除しますか?`)) return;
+    run(async () => {
+      for (const id of selected) {
+        await api.deleteMail(id);
+      }
+      await refreshMail();
+    });
+  };
+
   const makeTable = async (
     msgs: api.MailMessage[],
     who: (m: api.MailMessage) => string,
   ) => {
+    const rowChecks: HTMLInputElement[] = [];
     const tbody = el("tbody");
     for (const m of msgs) {
+      const check = el("input", { type: "checkbox" });
+      check.onchange = () => {
+        if (check.checked) selected.add(m.id);
+        else selected.delete(m.id);
+        updateBulk();
+      };
+      rowChecks.push(check);
       const subject = await decryptSubject(m);
       const subjectCell = el("td", { class: "name-cell" }, subject || "(件名なし)");
       subjectCell.onclick = () => run(() => openMailView(m.id));
@@ -744,6 +875,7 @@ async function refreshMail(): Promise<void> {
         el(
           "tr",
           {},
+          el("td", { class: "check-cell" }, check),
           subjectCell,
           el("td", { class: "muted" }, who(m)),
           el("td", { class: "muted" }, fmtDate(m.created_at)),
@@ -751,6 +883,15 @@ async function refreshMail(): Promise<void> {
         ),
       );
     }
+    const checkAll = el("input", { type: "checkbox", title: "すべて選択" });
+    checkAll.onchange = () => {
+      for (let i = 0; i < msgs.length; i++) {
+        rowChecks[i].checked = checkAll.checked;
+        if (checkAll.checked) selected.add(msgs[i].id);
+        else selected.delete(msgs[i].id);
+      }
+      updateBulk();
+    };
     return el(
       "table",
       {},
@@ -760,6 +901,7 @@ async function refreshMail(): Promise<void> {
         el(
           "tr",
           {},
+          el("th", { class: "check-cell" }, checkAll),
           el("th", {}, "件名"),
           el("th", {}, ""),
           el("th", {}, "日時"),
@@ -769,10 +911,11 @@ async function refreshMail(): Promise<void> {
       tbody,
     );
   };
+  updateBulk();
 
   panel.replaceChildren(
     el("h2", {}, "メール"),
-    el("div", { class: "toolbar" }, composeBtn, refreshBtn),
+    el("div", { class: "toolbar" }, composeBtn, refreshBtn, bulkDelBtn, bulkCount),
     el("h3", {}, "受信箱"),
     inbox.length
       ? await makeTable(inbox, (m) => `${m.from} さんから`)
