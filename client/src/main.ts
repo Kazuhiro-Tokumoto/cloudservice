@@ -500,6 +500,7 @@ async function refreshFiles(): Promise<void> {
     entries.length
       ? table
       : el("div", { class: "empty" }, "ファイルはありません"),
+    buildPreviewPane(),
   );
 }
 
@@ -515,7 +516,7 @@ function isTextFile(name: string): boolean {
   );
 }
 
-// --- プレビュー(画像・PDF・動画・音声をブラウザ内で復号して表示) ---
+// --- 常設プレビュー(画像と PDF のみ。ファイル一覧の下に表示し続ける) ---
 
 const MIME_TYPES: Record<string, string> = {
   png: "image/png",
@@ -527,80 +528,62 @@ const MIME_TYPES: Record<string, string> = {
   bmp: "image/bmp",
   avif: "image/avif",
   pdf: "application/pdf",
-  mp4: "video/mp4",
-  m4v: "video/mp4",
-  webm: "video/webm",
-  mov: "video/quicktime",
-  mp3: "audio/mpeg",
-  wav: "audio/wav",
-  ogg: "audio/ogg",
-  m4a: "audio/mp4",
-  flac: "audio/flac",
 };
 
-function previewKind(name: string): "image" | "pdf" | "video" | "audio" | null {
+function previewKind(name: string): "image" | "pdf" | null {
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
   const mime = MIME_TYPES[ext];
   if (!mime) return null;
-  if (mime.startsWith("image/")) return "image";
-  if (mime === "application/pdf") return "pdf";
-  if (mime.startsWith("video/")) return "video";
-  if (mime.startsWith("audio/")) return "audio";
-  return null;
+  return mime === "application/pdf" ? "pdf" : "image";
+}
+
+// 選択中のプレビュー。閉じるまで(別のファイルを選ぶまで)表示し続ける。
+let previewState: {
+  path: string;
+  name: string;
+  url: string;
+  kind: "image" | "pdf";
+} | null = null;
+
+function buildPreviewPane(): HTMLElement {
+  const pane = el("div", { class: "preview-pane", id: "preview-pane" });
+  if (!previewState) {
+    pane.hidden = true;
+    return pane;
+  }
+  const { name, url, kind } = previewState;
+
+  const closeBtn = el("button", { class: "ghost" }, "プレビューを閉じる");
+  closeBtn.onclick = () => {
+    if (previewState) URL.revokeObjectURL(previewState.url);
+    previewState = null;
+    document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
+  };
+
+  const content =
+    kind === "image"
+      ? el("img", { src: url, alt: name })
+      : el("iframe", { src: url, title: name });
+
+  pane.append(
+    el("div", { class: "preview-head" }, el("strong", {}, name), closeBtn),
+    el("div", { class: "preview-box" }, content),
+  );
+  return pane;
 }
 
 async function openPreview(path: string, name: string): Promise<void> {
+  const kind = previewKind(name);
+  if (!kind) return;
   const blob = await api.downloadFile(path);
   const data = await decryptFileWithMaster(userKeys!.masterKey, blob);
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
   const url = URL.createObjectURL(
-    new Blob([data as BufferSource], { type: MIME_TYPES[ext] ?? "application/octet-stream" }),
+    new Blob([data as BufferSource], { type: MIME_TYPES[ext]! }),
   );
-
-  let content: HTMLElement;
-  switch (previewKind(name)) {
-    case "image":
-      content = el("img", { src: url, alt: name });
-      break;
-    case "pdf":
-      content = el("iframe", { src: url, title: name });
-      break;
-    case "video": {
-      const v = el("video", { src: url });
-      v.controls = true;
-      content = v;
-      break;
-    }
-    case "audio": {
-      const a = el("audio", { src: url });
-      a.controls = true;
-      content = a;
-      break;
-    }
-    default:
-      URL.revokeObjectURL(url);
-      saveBytes(data, name);
-      return;
-  }
-
-  const dialog = el("dialog", { class: "wide preview" });
-  const close = () => {
-    URL.revokeObjectURL(url);
-    closeDialog(dialog);
-  };
-  const dlBtn = el("button", { type: "button" }, "ダウンロード");
-  dlBtn.onclick = () => saveBytes(data, name);
-  const closeBtn = el("button", { type: "button" }, "閉じる");
-  closeBtn.onclick = close;
-  dialog.onclose = () => URL.revokeObjectURL(url);
-
-  dialog.append(
-    el("h2", {}, name),
-    el("div", { class: "preview-box" }, content),
-    el("div", { class: "toolbar" }, dlBtn, closeBtn),
-  );
-  document.body.append(dialog);
-  dialog.showModal();
+  if (previewState) URL.revokeObjectURL(previewState.url);
+  previewState = { path, name, url, kind };
+  document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
 }
 
 // --- テキストエディタ ---
