@@ -1,8 +1,11 @@
 // Package auth は認証キーの導出とセッショントークンの発行・検証を行う。
 //
-// 認証方式:
-//   - クライアントは「ユーザー名:パスワード」を SHA-256 でハッシュ化した値(認証キー)を
-//     秘密鍵として送信する。生パスワードは通信に乗らない。
+// 認証・暗号化方式 (v2):
+//   - クライアントはパスワードから PBKDF2-SHA256 で 64 バイトを導出し、
+//     前半 32 バイトを「認証キー」としてサーバーに送信、
+//     後半 32 バイトを「包み鍵」としてブラウザ内に留める(サーバーは知り得ない)。
+//   - 包み鍵はユーザーのマスター鍵・秘密鍵の暗号化にのみ使われ、
+//     ファイル本体はエンドツーエンド暗号化されるためサーバーでは読めない。
 //   - サーバーは認証キーの bcrypt ハッシュのみを保存する。
 //   - ログイン成功後は HMAC-SHA256 署名付きトークンを発行し、
 //     ファイルの読み書きなど全 API はこのトークンで認可する。
@@ -23,13 +26,20 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/pbkdf2"
 )
 
+// PBKDF2Iterations はクライアント(Web Crypto)と一致させること。
+const PBKDF2Iterations = 310000
+
 // DeriveAuthKey はユーザー名とパスワードから認証キー(hex 64 文字)を導出する。
-// クライアント側(Web Crypto)と同じ計算: SHA-256("username:password")
+// クライアント側 crypto.ts の deriveKeys と同じ計算:
+// PBKDF2-SHA256(password, "cloudservice/v2:"+username, 310000 回, 64 バイト) の前半 32 バイト。
+// 後半 32 バイト(包み鍵)はクライアント専用のため、サーバー側では導出しない。
 func DeriveAuthKey(username, password string) string {
-	sum := sha256.Sum256([]byte(username + ":" + password))
-	return hex.EncodeToString(sum[:])
+	salt := []byte("cloudservice/v2:" + username)
+	bits := pbkdf2.Key([]byte(password), salt, PBKDF2Iterations, 64, sha256.New)
+	return hex.EncodeToString(bits[:32])
 }
 
 // HashAuthKey は保存用に認証キーを bcrypt でハッシュ化する。

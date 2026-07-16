@@ -1,9 +1,12 @@
 {
-  "addr": ":8443",
+  "addr": ":40000",
   "cert_dir": "certs",
-  "cert_name": "myserver",
+  "cert_name": "",
+  "cert_file": "/etc/letsencrypt/live/mail.shudo-physics.com/fullchain.pem",
+  "key_file": "/etc/letsencrypt/live/mail.shudo-physics.com/privkey.pem",
   "data_dir": "data",
   "web_dir": "web",
-  "session_hours": 24,
-  "max_upload_mb": 1024
+  "session_hours": 168,
+  "max_upload_mb": 1024,
+  "quota_mb": 10240
 }

@@ -12,11 +12,14 @@ import (
 )
 
 // User は登録ユーザー。パスワードそのものは保存せず、
-// 認証キー(SHA-256("user:pass"))の bcrypt ハッシュのみを持つ。
+// 認証キー(PBKDF2 派生値の前半)の bcrypt ハッシュのみを持つ。
 type User struct {
 	Username    string    `json:"username"`
 	AuthKeyHash string    `json:"auth_key_hash"`
 	CreatedAt   time.Time `json:"created_at"`
+	// KeyBundle はクライアントが管理する鍵の入れ物(公開鍵 + 暗号化済み秘密鍵/マスター鍵)。
+	// サーバーにとっては不透明な JSON で、public_key 以外は復号できない。
+	KeyBundle json.RawMessage `json:"key_bundle,omitempty"`
 }
 
 // Share は共有エントリ。TargetUser が空なら誰でも開けるリンク共有。
@@ -27,6 +30,9 @@ type Share struct {
 	TargetUser string    `json:"target_user"` // 共有先ユーザー(空 = リンク共有)
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"` // ゼロ値 = 無期限
+	// WrappedKey は共有先ユーザーの公開鍵で包んだファイル鍵(ユーザー共有のみ)。
+	// リンク共有ではファイル鍵は URL のフラグメントに入り、サーバーには保存されない。
+	WrappedKey string `json:"wrapped_key,omitempty"`
 }
 
 // Expired は共有が期限切れかどうかを返す。
@@ -155,6 +161,40 @@ func (s *Store) SetAuthKeyHash(username, hash string) error {
 	return s.saveUsersLocked()
 }
 
+// ErrKeyBundleExists は上書きが許可されていないのに鍵バンドルが既にある場合のエラー。
+var ErrKeyBundleExists = errors.New("鍵バンドルは既に登録されています")
+
+// SetKeyBundle はユーザーの鍵バンドルを保存する。
+// overwrite が false で既に登録済みの場合は ErrKeyBundleExists を返す。
+func (s *Store) SetKeyBundle(username string, bundle json.RawMessage, overwrite bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[username]
+	if !ok {
+		return ErrNotFound
+	}
+	if len(u.KeyBundle) > 0 && !overwrite {
+		return ErrKeyBundleExists
+	}
+	u.KeyBundle = bundle
+	s.users[username] = u
+	return s.saveUsersLocked()
+}
+
+// SetAuthAndKeyBundle はパスワード変更時に認証キーと鍵バンドルをまとめて更新する。
+func (s *Store) SetAuthAndKeyBundle(username, hash string, bundle json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[username]
+	if !ok {
+		return ErrNotFound
+	}
+	u.AuthKeyHash = hash
+	u.KeyBundle = bundle
+	s.users[username] = u
+	return s.saveUsersLocked()
+}
+
 // DeleteUser はユーザーを削除する。
 func (s *Store) DeleteUser(username string) error {
 	s.mu.Lock()
@@ -172,6 +212,17 @@ func (s *Store) GetUser(username string) (User, bool) {
 	defer s.mu.Unlock()
 	u, ok := s.users[username]
 	return u, ok
+}
+
+// Users は全ユーザーの情報を返す(管理用)。
+func (s *Store) Users() []User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	us := make([]User, 0, len(s.users))
+	for _, u := range s.users {
+		us = append(us, u)
+	}
+	return us
 }
 
 // ListUsers は全ユーザー名を返す。

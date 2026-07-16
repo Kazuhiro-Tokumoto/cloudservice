@@ -8,7 +8,6 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": { target, secure: false },
-      "/s": { target, secure: false },
     },
   },
   build: {

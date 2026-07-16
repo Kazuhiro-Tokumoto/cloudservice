@@ -1,12 +1,33 @@
 // クラウドサービス Web クライアント本体。
-// ログイン → ファイル一覧・アップロード・ダウンロード・削除・共有 を提供する。
+// すべてのファイルはブラウザ内で暗号化されてからアップロードされ、
+// サーバー(管理者を含む)はファイルの中身を読めない。
 import * as api from "./api";
-import { deriveAuthKey } from "./crypto";
+import {
+  BLOB_OVERHEAD,
+  createKeyBundle,
+  decryptBytesWithRawKey,
+  decryptFileWithMaster,
+  decryptFileWithRawKey,
+  deriveKeys,
+  encryptBytesWithRawKey,
+  encryptFile,
+  fromB64Url,
+  newRawKey,
+  openKeyBundle,
+  rewrapKeyBundle,
+  toB64Url,
+  unwrapFileKey,
+  unwrapKeyFromUser,
+  wrapKeyForUser,
+  type UserKeys,
+} from "./crypto";
+import { clearKeys, loadKeys, saveKeys } from "./keystore";
 
 const app = document.getElementById("app")!;
 
 let currentUser = "";
 let currentPath = "";
+let userKeys: UserKeys | null = null;
 
 // --- ユーティリティ ---
 
@@ -24,7 +45,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
-function fmtSize(n: number): string {
+function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
@@ -36,12 +57,16 @@ function fmtSize(n: number): string {
   return `${v.toFixed(1)} ${units[i]}`;
 }
 
+function fmtSize(encryptedSize: number): string {
+  return fmtBytes(Math.max(0, encryptedSize - BLOB_OVERHEAD));
+}
+
 function fmtDate(iso: string): string {
   return new Date(iso).toLocaleString("ja-JP");
 }
 
-function saveBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
+function saveBytes(data: Uint8Array, filename: string): void {
+  const url = URL.createObjectURL(new Blob([data as BufferSource]));
   const a = el("a", { href: url, download: filename });
   a.click();
   URL.revokeObjectURL(url);
@@ -57,22 +82,34 @@ function showError(msg: string): void {
   }
 }
 
+function hideError(): void {
+  const banner = document.getElementById("error-banner");
+  if (banner) banner.hidden = true;
+}
+
 async function run(action: () => Promise<void>): Promise<void> {
   try {
+    hideError();
     await action();
   } catch (e) {
     showError(e instanceof Error ? e.message : String(e));
-    // 認証切れならログイン画面へ
     if (!api.savedSession() && currentUser) {
+      // トークン失効 → ログイン画面へ
       currentUser = "";
+      userKeys = null;
       renderLogin();
     }
   }
 }
 
-// --- ログイン画面 ---
+function closeDialog(dialog: HTMLDialogElement): void {
+  dialog.close();
+  dialog.remove();
+}
 
-function renderLogin(): void {
+// --- ログイン ---
+
+function renderLogin(notice = ""): void {
   const username = el("input", {
     type: "text",
     placeholder: "ユーザー名",
@@ -83,21 +120,54 @@ function renderLogin(): void {
     placeholder: "パスワード",
     autocomplete: "current-password",
   });
-  const msg = el("div", { class: "note", id: "login-msg" });
+  const msg = el("div", { class: "note" }, notice);
   const btn = el("button", { class: "primary", type: "submit" }, "ログイン");
 
   const form = el("form", {}, username, password, btn, msg);
   form.onsubmit = async (ev) => {
     ev.preventDefault();
-    msg.textContent = "認証キーを計算中…";
+    btn.disabled = true;
+    msg.textContent = "鍵を導出しています…";
     try {
-      // パスワードは送らず、SHA-256 で導出した認証キーを秘密鍵として送信
-      const key = await deriveAuthKey(username.value, password.value);
-      currentUser = await api.login(username.value, key);
+      const { authKey, wrapKey } = await deriveKeys(
+        username.value,
+        password.value,
+      );
+      currentUser = await api.login(username.value, authKey);
+
+      // 鍵バンドル: 初回なら生成、2 回目以降は包み鍵で開く
+      msg.textContent = "暗号鍵を準備しています…";
+      const existing = await api.getKeyBundle();
+      if (!existing) {
+        const { bundle, keys } = await createKeyBundle(wrapKey);
+        await api.putKeyBundle(bundle);
+        userKeys = keys;
+      } else {
+        try {
+          userKeys = await openKeyBundle(wrapKey, existing);
+        } catch {
+          // userctl でパスワードリセットされた等で包み鍵が合わない
+          if (
+            !confirm(
+              "保存されている暗号鍵をこのパスワードで開けませんでした。\n" +
+                "(管理者によるパスワードリセット後などに起こります)\n\n" +
+                "鍵を作り直しますか? 作り直すと今までの暗号化ファイルは読めなくなります。",
+            )
+          ) {
+            throw new Error("鍵を開けなかったためログインを中止しました");
+          }
+          const { bundle, keys } = await createKeyBundle(wrapKey);
+          await api.putKeyBundle(bundle, true);
+          userKeys = keys;
+        }
+      }
+      await saveKeys(currentUser, userKeys);
       currentPath = "";
       await renderMain();
     } catch (e) {
       msg.textContent = e instanceof Error ? e.message : String(e);
+    } finally {
+      btn.disabled = false;
     }
   };
 
@@ -108,12 +178,14 @@ function renderLogin(): void {
       el(
         "div",
         { class: "login-card" },
-        el("h1", {}, "☁ クラウドサービス"),
+        el("h1", {}, "クラウドサービス"),
         form,
         el(
           "div",
           { class: "note" },
-          "パスワードはブラウザ内でハッシュ化され、そのまま送信されることはありません。アカウントは管理者に発行してもらってください。",
+          "ファイルはブラウザ内で暗号化され、サーバー管理者もその中身を読めません。" +
+            "パスワードを忘れるとファイルを復元できないので注意してください。" +
+            "アカウントは管理者に発行してもらってください。",
         ),
       ),
     ),
@@ -123,40 +195,89 @@ function renderLogin(): void {
 // --- メイン画面 ---
 
 async function renderMain(): Promise<void> {
-  const errorBanner = el("div", {
-    class: "error-banner",
-    id: "error-banner",
-  });
+  const errorBanner = el("div", { class: "error-banner", id: "error-banner" });
   errorBanner.hidden = true;
 
-  const logoutBtn = el("button", {}, "ログアウト");
-  logoutBtn.onclick = () => {
+  const passwordBtn = el("button", { class: "ghost" }, "パスワード変更");
+  passwordBtn.onclick = () => openPasswordDialog();
+
+  const logoutBtn = el("button", { class: "ghost" }, "ログアウト");
+  logoutBtn.onclick = async () => {
+    await clearKeys(currentUser);
     api.clearSession();
     api.setToken("");
     currentUser = "";
+    userKeys = null;
     renderLogin();
   };
 
-  const filesSection = el("section", { class: "panel", id: "files-panel" });
-  const sharesSection = el("section", { class: "panel", id: "shares-panel" });
+  // タブ: ファイル / メール / 共有
+  const tabs: { id: string; label: string; refresh: () => Promise<void> }[] = [
+    { id: "files-panel", label: "ファイル", refresh: refreshFiles },
+    { id: "mail-panel", label: "メール", refresh: refreshMail },
+    { id: "shares-panel", label: "共有", refresh: refreshShares },
+  ];
+  const nav = el("nav", { class: "tabs" });
+  const showTab = (id: string) => {
+    for (const t of tabs) {
+      document.getElementById(t.id)!.hidden = t.id !== id;
+    }
+    nav.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tab === id);
+    });
+    const tab = tabs.find((t) => t.id === id)!;
+    run(tab.refresh);
+  };
+  for (const t of tabs) {
+    const btn = el("button", { "data-tab": t.id }, t.label);
+    btn.onclick = () => showTab(t.id);
+    nav.append(btn);
+  }
 
   app.replaceChildren(
     el(
       "header",
       { class: "topbar" },
-      el("h1", {}, "☁ クラウドサービス"),
-      el("div", { class: "userbox" }, `${currentUser} さん`, logoutBtn),
+      el("h1", {}, "クラウドサービス"),
+      el(
+        "div",
+        { class: "userbox" },
+        el("span", { class: "lock", title: "エンドツーエンド暗号化" }, "🔒"),
+        `${currentUser} さん`,
+        passwordBtn,
+        logoutBtn,
+      ),
     ),
-    el("main", {}, errorBanner, filesSection, sharesSection),
+    nav,
+    el(
+      "main",
+      {},
+      errorBanner,
+      el("section", { class: "panel", id: "files-panel" }),
+      el("section", { class: "panel", id: "mail-panel" }),
+      el("section", { class: "panel", id: "shares-panel" }),
+    ),
   );
-
-  await run(refreshFiles);
-  await run(refreshShares);
+  showTab("files-panel");
 }
 
 async function refreshFiles(): Promise<void> {
   const panel = document.getElementById("files-panel")!;
-  const entries = await api.listFiles(currentPath);
+  const [entries, quota] = await Promise.all([
+    api.listFiles(currentPath),
+    api.getQuota(),
+  ]);
+
+  // 使用容量(ファイル + メールで 10GB まで)
+  const pct = Math.min(100, (quota.used / quota.limit) * 100);
+  const bar = el("span");
+  bar.style.width = `${pct}%`;
+  const quotaBox = el(
+    "div",
+    { class: "quota", title: "ファイルとメールの合計" },
+    el("div", { class: "bar" }, bar),
+    `${fmtBytes(quota.used)} / ${fmtBytes(quota.limit)} 使用中`,
+  );
 
   // パンくずリスト
   const crumbs = el("div", { class: "breadcrumb" });
@@ -186,15 +307,17 @@ async function refreshFiles(): Promise<void> {
     run(async () => {
       for (const f of fileInput.files ?? []) {
         const dest = currentPath ? `${currentPath}/${f.name}` : f.name;
-        await api.uploadFile(dest, f);
+        const data = new Uint8Array(await f.arrayBuffer());
+        const blob = await encryptFile(userKeys!.masterKey, data);
+        await api.uploadFile(dest, blob);
       }
       fileInput.value = "";
       await refreshFiles();
     });
-  const uploadBtn = el("button", { class: "primary" }, "⬆ アップロード");
+  const uploadBtn = el("button", { class: "primary" }, "アップロード");
   uploadBtn.onclick = () => fileInput.click();
 
-  const mkdirBtn = el("button", {}, "📁 フォルダ作成");
+  const mkdirBtn = el("button", {}, "フォルダ作成");
   mkdirBtn.onclick = () => {
     const name = prompt("フォルダ名を入力してください");
     if (!name) return;
@@ -204,28 +327,30 @@ async function refreshFiles(): Promise<void> {
     });
   };
 
-  const newFileBtn = el("button", {}, "📝 テキスト作成");
+  const newFileBtn = el("button", {}, "テキスト作成");
   newFileBtn.onclick = () => {
     const name = prompt("ファイル名を入力してください", "memo.txt");
     if (!name) return;
     run(async () => {
       const dest = currentPath ? `${currentPath}/${name}` : name;
-      await api.uploadFile(dest, new Blob([""]));
+      const blob = await encryptFile(userKeys!.masterKey, new Uint8Array(0));
+      await api.uploadFile(dest, blob);
       await refreshFiles();
       await openEditor(dest);
     });
   };
 
-  const refreshBtn = el("button", {}, "↻ 更新");
+  const refreshBtn = el("button", {}, "更新");
   refreshBtn.onclick = () => run(refreshFiles);
 
-  // ファイル一覧テーブル
+  // ファイル一覧
   const tbody = el("tbody");
   for (const entry of entries) {
     const nameCell = el(
       "td",
-      { class: entry.is_dir ? "name-cell" : "name-cell" },
-      (entry.is_dir ? "📁 " : "📄 ") + entry.name,
+      { class: "name-cell" },
+      el("span", { class: "icon" }, entry.is_dir ? "📁" : "📄"),
+      entry.name,
     );
     nameCell.onclick = () => {
       if (entry.is_dir) {
@@ -234,20 +359,19 @@ async function refreshFiles(): Promise<void> {
       } else if (isTextFile(entry.name) && entry.size < 1024 * 1024) {
         run(() => openEditor(entry.path));
       } else {
-        run(async () => saveBlob(await api.downloadFile(entry.path), entry.name));
+        run(async () => downloadAndSave(entry.path, entry.name));
       }
     };
 
     const actions = el("td", { class: "actions" });
     if (!entry.is_dir) {
-      const dl = el("button", { class: "link", title: "ダウンロード" }, "⬇");
-      dl.onclick = () =>
-        run(async () => saveBlob(await api.downloadFile(entry.path), entry.name));
-      const share = el("button", { class: "link", title: "共有" }, "🔗");
-      share.onclick = () => openShareDialog(entry.path);
+      const dl = el("button", { class: "link" }, "ダウンロード");
+      dl.onclick = () => run(async () => downloadAndSave(entry.path, entry.name));
+      const share = el("button", { class: "link" }, "共有");
+      share.onclick = () => run(() => openShareDialog(entry.path));
       actions.append(dl, share);
     }
-    const del = el("button", { class: "link danger", title: "削除" }, "🗑");
+    const del = el("button", { class: "link danger" }, "削除");
     del.onclick = () => {
       if (!confirm(`「${entry.name}」を削除しますか?`)) return;
       run(async () => {
@@ -262,8 +386,8 @@ async function refreshFiles(): Promise<void> {
         "tr",
         {},
         nameCell,
-        el("td", {}, entry.is_dir ? "—" : fmtSize(entry.size)),
-        el("td", {}, fmtDate(entry.mod_time)),
+        el("td", { class: "muted" }, entry.is_dir ? "—" : fmtSize(entry.size)),
+        el("td", { class: "muted" }, fmtDate(entry.mod_time)),
         actions,
       ),
     );
@@ -296,11 +420,21 @@ async function refreshFiles(): Promise<void> {
       mkdirBtn,
       newFileBtn,
       refreshBtn,
+      el("span", { class: "spacer" }),
+      quotaBox,
       fileInput,
     ),
     crumbs,
-    entries.length ? table : el("div", { class: "empty" }, "ファイルはありません"),
+    entries.length
+      ? table
+      : el("div", { class: "empty" }, "ファイルはありません"),
   );
+}
+
+async function downloadAndSave(path: string, name: string): Promise<void> {
+  const blob = await api.downloadFile(path);
+  const data = await decryptFileWithMaster(userKeys!.masterKey, blob);
+  saveBytes(data, name);
 }
 
 function isTextFile(name: string): boolean {
@@ -309,36 +443,36 @@ function isTextFile(name: string): boolean {
   );
 }
 
-// --- テキストエディタ(ファイルの読み出し・書き込み) ---
+// --- テキストエディタ ---
 
 async function openEditor(path: string): Promise<void> {
-  const content = await api.readTextFile(path);
-  const dialog = el("dialog");
+  const blob = await api.downloadFile(path);
+  const data = await decryptFileWithMaster(userKeys!.masterKey, blob);
+  const content = new TextDecoder().decode(data);
+
+  const dialog = el("dialog", { class: "wide" });
   const textarea = el("textarea", { rows: "16" }) as HTMLTextAreaElement;
-  textarea.style.width = "100%";
-  textarea.style.fontFamily = "monospace";
   textarea.value = content;
 
   const saveBtn = el("button", { class: "primary", type: "button" }, "保存");
   saveBtn.onclick = () =>
     run(async () => {
-      await api.uploadFile(path, new Blob([textarea.value]));
-      dialog.close();
-      dialog.remove();
+      const enc = await encryptFile(
+        userKeys!.masterKey,
+        new TextEncoder().encode(textarea.value),
+      );
+      await api.uploadFile(path, enc);
+      closeDialog(dialog);
       await refreshFiles();
     });
   const closeBtn = el("button", { type: "button" }, "閉じる");
-  closeBtn.onclick = () => {
-    dialog.close();
-    dialog.remove();
-  };
+  closeBtn.onclick = () => closeDialog(dialog);
 
   dialog.append(
     el("h2", {}, path),
     textarea,
     el("div", { class: "toolbar" }, saveBtn, closeBtn),
   );
-  dialog.style.width = "640px";
   document.body.append(dialog);
   dialog.showModal();
 }
@@ -350,28 +484,37 @@ async function openShareDialog(path: string): Promise<void> {
 
   const dialog = el("dialog");
   const targetSelect = el("select");
-  targetSelect.append(el("option", { value: "" }, "リンク共有(URL を知っていれば誰でも)"));
+  targetSelect.append(
+    el("option", { value: "" }, "リンク共有(URL を知っている人が復号可)"),
+  );
   for (const u of users) {
     targetSelect.append(el("option", { value: u }, `ユーザー: ${u}`));
   }
-  const expires = el("input", {
-    type: "number",
-    min: "0",
-    value: "0",
-    title: "有効日数(0 = 無期限)",
-  });
+  const expires = el("input", { type: "number", min: "0", value: "0" });
   const result = el("div", { class: "share-url" });
 
-  const createBtn = el("button", { class: "primary", type: "button" }, "共有を作成");
+  const createBtn = el(
+    "button",
+    { class: "primary", type: "button" },
+    "共有を作成",
+  );
   createBtn.onclick = () =>
     run(async () => {
-      const res = await api.createShare(
-        path,
-        targetSelect.value,
-        Number(expires.value) || 0,
-      );
-      if (res.url) {
-        const full = `${location.origin}${res.url}`;
+      // ファイル先頭のヘッダーからファイル鍵を取り出す
+      const header = await api.downloadFileHeader(path);
+      const fileKeyRaw = await unwrapFileKey(userKeys!.masterKey, header);
+      const days = Number(expires.value) || 0;
+
+      if (targetSelect.value) {
+        // ユーザー共有: 相手の公開鍵でファイル鍵を包み直す
+        const pub = await api.getUserPublicKey(targetSelect.value);
+        const wrapped = await wrapKeyForUser(fileKeyRaw, pub);
+        await api.createShare(path, targetSelect.value, days, wrapped);
+        result.textContent = `${targetSelect.value} さんに共有しました(相手だけが復号できます)`;
+      } else {
+        // リンク共有: 鍵は URL のフラグメントに載せる(サーバーへは送信されない)
+        const res = await api.createShare(path, "", days, "");
+        const full = `${location.origin}${res.url}#k=${toB64Url(fileKeyRaw)}`;
         result.textContent = `共有リンク: ${full}`;
         try {
           await navigator.clipboard.writeText(full);
@@ -379,21 +522,16 @@ async function openShareDialog(path: string): Promise<void> {
         } catch {
           /* クリップボード不可の環境では表示のみ */
         }
-      } else {
-        result.textContent = `${targetSelect.value} さんに共有しました`;
       }
       await refreshShares();
     });
   const closeBtn = el("button", { type: "button" }, "閉じる");
-  closeBtn.onclick = () => {
-    dialog.close();
-    dialog.remove();
-  };
+  closeBtn.onclick = () => closeDialog(dialog);
 
   dialog.append(
     el("h2", {}, `「${path}」を共有`),
-    el("div", {}, "共有先: ", targetSelect),
-    el("div", {}, "有効日数(0 = 無期限): ", expires),
+    el("label", {}, "共有先: ", targetSelect),
+    el("label", {}, "有効日数(0 = 無期限): ", expires),
     el("div", { class: "toolbar" }, createBtn, closeBtn),
     result,
   );
@@ -407,17 +545,24 @@ async function refreshShares(): Promise<void> {
 
   const receivedBody = el("tbody");
   for (const sh of received) {
-    const dl = el("button", { class: "link" }, "⬇ ダウンロード");
     const filename = sh.path.split("/").pop() ?? sh.path;
+    const dl = el("button", { class: "link" }, "ダウンロード");
     dl.onclick = () =>
-      run(async () => saveBlob(await api.downloadShared(sh.id), filename));
+      run(async () => {
+        const blob = await api.downloadShared(sh.id);
+        const fileKeyRaw = await unwrapKeyFromUser(
+          userKeys!.privateKey,
+          sh.wrapped_key ?? "",
+        );
+        saveBytes(await decryptFileWithRawKey(fileKeyRaw, blob), filename);
+      });
     receivedBody.append(
       el(
         "tr",
         {},
-        el("td", {}, `📄 ${filename}`),
-        el("td", {}, `${sh.owner} さんから`),
-        el("td", {}, fmtDate(sh.created_at)),
+        el("td", {}, filename),
+        el("td", { class: "muted" }, `${sh.owner} さんから`),
+        el("td", { class: "muted" }, fmtDate(sh.created_at)),
         el("td", { class: "actions" }, dl),
       ),
     );
@@ -425,23 +570,8 @@ async function refreshShares(): Promise<void> {
 
   const mineBody = el("tbody");
   for (const sh of mine) {
-    const target = sh.target_user
-      ? `${sh.target_user} さんへ`
-      : "リンク共有";
+    const target = sh.target_user ? `${sh.target_user} さんへ` : "リンク共有";
     const cells = el("td", { class: "actions" });
-    if (!sh.target_user) {
-      const copy = el("button", { class: "link" }, "URL コピー");
-      copy.onclick = async () => {
-        const full = `${location.origin}/s/${sh.id}`;
-        try {
-          await navigator.clipboard.writeText(full);
-          copy.textContent = "コピーしました";
-        } catch {
-          prompt("共有 URL:", full);
-        }
-      };
-      cells.append(copy);
-    }
     const del = el("button", { class: "link danger" }, "解除");
     del.onclick = () =>
       run(async () => {
@@ -453,9 +583,9 @@ async function refreshShares(): Promise<void> {
       el(
         "tr",
         {},
-        el("td", {}, `📄 ${sh.path}`),
-        el("td", {}, target),
-        el("td", {}, fmtDate(sh.created_at)),
+        el("td", {}, sh.path),
+        el("td", { class: "muted" }, target),
+        el("td", { class: "muted" }, fmtDate(sh.created_at)),
         cells,
       ),
     );
@@ -463,7 +593,7 @@ async function refreshShares(): Promise<void> {
 
   panel.replaceChildren(
     el("h2", {}, "共有"),
-    el("h2", {}, "自分に共有されたファイル"),
+    el("h3", {}, "自分に共有されたファイル"),
     received.length
       ? el(
           "table",
@@ -483,7 +613,7 @@ async function refreshShares(): Promise<void> {
           receivedBody,
         )
       : el("div", { class: "empty" }, "共有されたファイルはありません"),
-    el("h2", {}, "自分が共有中のファイル"),
+    el("h3", {}, "自分が共有中のファイル"),
     mine.length
       ? el(
           "table",
@@ -503,16 +633,359 @@ async function refreshShares(): Promise<void> {
           mineBody,
         )
       : el("div", { class: "empty" }, "共有中のファイルはありません"),
+    el(
+      "div",
+      { class: "note" },
+      "共有リンクの復号鍵は URL の # 以降に入っており、サーバーには保存されません。" +
+        "リンクを共有した時点の URL 全体を相手に渡してください(共有一覧からは再取得できません)。",
+    ),
+  );
+}
+
+// --- メール(件名・本文とも E2E 暗号化) ---
+
+// 一覧表示用: 自分宛に包まれたメール鍵を解いて件名を復号する
+async function decryptSubject(m: api.MailMessage): Promise<string> {
+  try {
+    const mailKey = await unwrapKeyFromUser(userKeys!.privateKey, m.wrapped_key);
+    return new TextDecoder().decode(
+      await decryptBytesWithRawKey(mailKey, m.enc_subject),
+    );
+  } catch {
+    return "(復号できません)";
+  }
+}
+
+async function refreshMail(): Promise<void> {
+  const panel = document.getElementById("mail-panel")!;
+  const [inbox, sent] = await Promise.all([
+    api.listMail("inbox"),
+    api.listMail("sent"),
+  ]);
+
+  const composeBtn = el("button", { class: "primary" }, "新規メール");
+  composeBtn.onclick = () => run(() => openComposeDialog());
+  const refreshBtn = el("button", {}, "更新");
+  refreshBtn.onclick = () => run(refreshMail);
+
+  const makeTable = async (
+    msgs: api.MailMessage[],
+    who: (m: api.MailMessage) => string,
+  ) => {
+    const tbody = el("tbody");
+    for (const m of msgs) {
+      const subject = await decryptSubject(m);
+      const subjectCell = el("td", { class: "name-cell" }, subject || "(件名なし)");
+      subjectCell.onclick = () => run(() => openMailView(m.id));
+      const del = el("button", { class: "link danger" }, "削除");
+      del.onclick = () => {
+        if (!confirm(`「${subject}」を削除しますか?`)) return;
+        run(async () => {
+          await api.deleteMail(m.id);
+          await refreshMail();
+        });
+      };
+      tbody.append(
+        el(
+          "tr",
+          {},
+          subjectCell,
+          el("td", { class: "muted" }, who(m)),
+          el("td", { class: "muted" }, fmtDate(m.created_at)),
+          el("td", { class: "actions" }, del),
+        ),
+      );
+    }
+    return el(
+      "table",
+      {},
+      el(
+        "thead",
+        {},
+        el(
+          "tr",
+          {},
+          el("th", {}, "件名"),
+          el("th", {}, ""),
+          el("th", {}, "日時"),
+          el("th", {}, ""),
+        ),
+      ),
+      tbody,
+    );
+  };
+
+  panel.replaceChildren(
+    el("h2", {}, "メール"),
+    el("div", { class: "toolbar" }, composeBtn, refreshBtn),
+    el("h3", {}, "受信箱"),
+    inbox.length
+      ? await makeTable(inbox, (m) => `${m.from} さんから`)
+      : el("div", { class: "empty" }, "受信メールはありません"),
+    el("h3", {}, "送信済み"),
+    sent.length
+      ? await makeTable(sent, (m) => `${m.to} さんへ`)
+      : el("div", { class: "empty" }, "送信済みメールはありません"),
+    el(
+      "div",
+      { class: "note" },
+      "メールは件名・本文ともブラウザ内で暗号化され、宛先の人だけが読めます。" +
+        "メールも保存容量(ファイルと合わせて 10GB)に含まれます。",
+    ),
+  );
+}
+
+async function openComposeDialog(
+  prefTo = "",
+  prefSubject = "",
+): Promise<void> {
+  const users = (await api.listUsers()).filter((u) => u !== currentUser);
+
+  const dialog = el("dialog");
+  const toSelect = el("select");
+  for (const u of users) {
+    toSelect.append(el("option", { value: u }, u));
+  }
+  if (prefTo) toSelect.value = prefTo;
+  const subject = el("input", { type: "text", placeholder: "件名" });
+  subject.value = prefSubject;
+  const body = el("textarea", { rows: "10", placeholder: "本文" });
+  const msg = el("div", { class: "note" });
+
+  const sendBtn = el("button", { class: "primary", type: "button" }, "送信");
+  sendBtn.onclick = async () => {
+    if (!toSelect.value) {
+      msg.textContent = "宛先を選んでください";
+      return;
+    }
+    sendBtn.disabled = true;
+    msg.textContent = "暗号化して送信しています…";
+    try {
+      const te = new TextEncoder();
+      const mailKey = newRawKey();
+      const [encSubject, encBody, toPub] = await Promise.all([
+        encryptBytesWithRawKey(mailKey, te.encode(subject.value)),
+        encryptBytesWithRawKey(mailKey, te.encode(body.value)),
+        api.getUserPublicKey(toSelect.value),
+      ]);
+      await api.sendMail({
+        to: toSelect.value,
+        enc_subject: encSubject,
+        enc_body: encBody,
+        // 宛先が読めるように相手の公開鍵で、自分も送信済みを読めるように自分の公開鍵で包む
+        wrapped_key_to: await wrapKeyForUser(mailKey, toPub),
+        wrapped_key_self: await wrapKeyForUser(mailKey, userKeys!.publicKeySpki),
+      });
+      closeDialog(dialog);
+      await refreshMail();
+    } catch (e) {
+      msg.textContent = e instanceof Error ? e.message : String(e);
+      sendBtn.disabled = false;
+    }
+  };
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = () => closeDialog(dialog);
+
+  dialog.append(
+    el("h2", {}, "新規メール"),
+    el("label", {}, "宛先: ", toSelect),
+    subject,
+    body,
+    el("div", { class: "toolbar" }, sendBtn, closeBtn),
+    msg,
+  );
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+async function openMailView(id: string): Promise<void> {
+  const m = await api.getMail(id);
+  const mailKey = await unwrapKeyFromUser(userKeys!.privateKey, m.wrapped_key);
+  const td = new TextDecoder();
+  const subject = td.decode(await decryptBytesWithRawKey(mailKey, m.enc_subject));
+  const body = td.decode(await decryptBytesWithRawKey(mailKey, m.enc_body ?? ""));
+
+  const dialog = el("dialog", { class: "wide" });
+  const pre = el("pre", { class: "mail-body" }, body);
+
+  const buttons = el("div", { class: "toolbar" });
+  if (m.folder === "inbox") {
+    const replyBtn = el("button", { type: "button" }, "返信");
+    replyBtn.onclick = () => {
+      closeDialog(dialog);
+      run(() =>
+        openComposeDialog(
+          m.from,
+          subject.startsWith("Re:") ? subject : `Re: ${subject}`,
+        ),
+      );
+    };
+    buttons.append(replyBtn);
+  }
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = () => closeDialog(dialog);
+  buttons.append(closeBtn);
+
+  dialog.append(
+    el("h2", {}, subject || "(件名なし)"),
+    el(
+      "div",
+      { class: "note" },
+      `${m.from} さんから ${m.to} さんへ · ${fmtDate(m.created_at)}`,
+    ),
+    pre,
+    buttons,
+  );
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+// --- パスワード変更(マスター鍵は変わらないので既存ファイルはそのまま読める) ---
+
+function openPasswordDialog(): void {
+  const dialog = el("dialog");
+  const current = el("input", {
+    type: "password",
+    placeholder: "現在のパスワード",
+    autocomplete: "current-password",
+  });
+  const next = el("input", {
+    type: "password",
+    placeholder: "新しいパスワード(8 文字以上)",
+    autocomplete: "new-password",
+  });
+  const next2 = el("input", {
+    type: "password",
+    placeholder: "新しいパスワード(確認)",
+    autocomplete: "new-password",
+  });
+  const msg = el("div", { class: "note" });
+  const okBtn = el("button", { class: "primary", type: "button" }, "変更する");
+  okBtn.onclick = async () => {
+    if (next.value.length < 8) {
+      msg.textContent = "新しいパスワードは 8 文字以上にしてください";
+      return;
+    }
+    if (next.value !== next2.value) {
+      msg.textContent = "新しいパスワードが一致しません";
+      return;
+    }
+    okBtn.disabled = true;
+    msg.textContent = "鍵を包み直しています…";
+    try {
+      const oldKeys = await deriveKeys(currentUser, current.value);
+      const bundle = await api.getKeyBundle();
+      if (!bundle) throw new Error("鍵バンドルが見つかりません");
+      const newKeys = await deriveKeys(currentUser, next.value);
+      // 現在のパスワードが違えばここで復号に失敗する
+      const newBundle = await rewrapKeyBundle(
+        oldKeys.wrapKey,
+        newKeys.wrapKey,
+        bundle,
+      );
+      await api.changePassword(newKeys.authKey, newBundle);
+      msg.textContent = "パスワードを変更しました";
+      setTimeout(() => closeDialog(dialog), 1200);
+    } catch (e) {
+      msg.textContent =
+        e instanceof Error && e.name === "OperationError"
+          ? "現在のパスワードが違います"
+          : e instanceof Error
+            ? e.message
+            : String(e);
+    } finally {
+      okBtn.disabled = false;
+    }
+  };
+  const closeBtn = el("button", { type: "button" }, "閉じる");
+  closeBtn.onclick = () => closeDialog(dialog);
+
+  dialog.append(
+    el("h2", {}, "パスワード変更"),
+    current,
+    next,
+    next2,
+    el("div", { class: "toolbar" }, okBtn, closeBtn),
+    msg,
+  );
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+// --- 共有リンクの閲覧ページ (/s/<token>#k=<鍵>) ---
+
+function renderShareViewer(token: string): void {
+  const keyParam = new URLSearchParams(location.hash.slice(1)).get("k");
+  const status = el("div", { class: "note" });
+  const dlBtn = el(
+    "button",
+    { class: "primary", type: "button" },
+    "ダウンロード",
+  );
+  dlBtn.disabled = !keyParam;
+  if (!keyParam) {
+    status.textContent =
+      "URL に復号鍵(# 以降の部分)がありません。リンク全体をコピーしたか確認してください。";
+  }
+  dlBtn.onclick = async () => {
+    dlBtn.disabled = true;
+    status.textContent = "取得して復号しています…";
+    try {
+      const { data, filename } = await api.downloadPublicShare(token);
+      const decrypted = await decryptFileWithRawKey(fromB64Url(keyParam!), data);
+      saveBytes(decrypted, filename);
+      status.textContent = `「${filename}」を保存しました`;
+    } catch (e) {
+      status.textContent = e instanceof Error ? e.message : String(e);
+    } finally {
+      dlBtn.disabled = false;
+    }
+  };
+
+  app.replaceChildren(
+    el(
+      "div",
+      { class: "login-wrap" },
+      el(
+        "div",
+        { class: "login-card" },
+        el("h1", {}, "共有ファイル"),
+        el(
+          "div",
+          { class: "note" },
+          "ファイルはブラウザ内で復号されます。復号鍵はサーバーに送信されません。",
+        ),
+        dlBtn,
+        status,
+      ),
+    ),
   );
 }
 
 // --- 起動 ---
 
-const session = api.savedSession();
-if (session) {
-  api.setToken(session.token);
-  currentUser = session.username;
-  renderMain();
-} else {
+async function start(): Promise<void> {
+  const shareMatch = /^\/s\/([A-Za-z0-9_-]+)$/.exec(location.pathname);
+  if (shareMatch) {
+    renderShareViewer(shareMatch[1]);
+    return;
+  }
+  const session = api.savedSession();
+  if (session) {
+    const keys = await loadKeys(session.username);
+    if (keys) {
+      api.setToken(session.token);
+      currentUser = session.username;
+      userKeys = keys;
+      await renderMain();
+      return;
+    }
+    // トークンはあるが鍵が無い(別ブラウザ等) → 再ログインで鍵を導出してもらう
+    api.clearSession();
+    renderLogin("暗号鍵を再導出するため、もう一度ログインしてください。");
+    return;
+  }
   renderLogin();
 }
+
+start();
