@@ -87,7 +87,7 @@ cp config.example.json config.json
   "cert_name": "mail",
   "data_dir": "data",
   "web_dir": "web",
-  "session_hours": 24,
+  "session_hours": 168,
   "max_upload_mb": 1024,
   "quota_mb": 10240
 }

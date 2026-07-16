@@ -25,7 +25,8 @@ type Config struct {
 	DataDir string `json:"data_dir"`
 	// WebDir はビルド済みクライアント(client/dist)のパス。空なら静的配信しない。
 	WebDir string `json:"web_dir"`
-	// SessionHours はログイントークンの有効時間(時間)。0 なら 24。
+	// SessionHours はログイントークンの有効時間(時間)。0 なら 168 (7日)。
+	// 期限が切れると再ログイン(パスワード入力)が必要になる。
 	SessionHours int `json:"session_hours"`
 	// MaxUploadMB は 1 ファイルの最大アップロードサイズ(MB)。0 なら 1024。
 	MaxUploadMB int64 `json:"max_upload_mb"`
@@ -45,7 +46,8 @@ func Default() Config {
 		CertName:     "",
 		DataDir:      "data",
 		WebDir:       "web",
-		SessionHours: 24,
+		SessionHours: 168, // 7 日
+
 		MaxUploadMB:  1024,
 		QuotaMB:      10240, // 10GB
 	}
@@ -65,7 +67,7 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("config %s の解析に失敗: %w", path, err)
 	}
 	if cfg.SessionHours <= 0 {
-		cfg.SessionHours = 24
+		cfg.SessionHours = 168 // 7 日
 	}
 	if cfg.MaxUploadMB <= 0 {
 		cfg.MaxUploadMB = 1024
