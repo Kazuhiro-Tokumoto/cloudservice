@@ -192,6 +192,75 @@ function renderLogin(notice = ""): void {
   );
 }
 
+// --- プッシュ通知(新着メール・共有受信をスマホ等に通知) ---
+
+function pushSupported(): boolean {
+  return (
+    "serviceWorker" in navigator &&
+    "PushManager" in window &&
+    "Notification" in window
+  );
+}
+
+async function registerSW(): Promise<ServiceWorkerRegistration> {
+  return navigator.serviceWorker.register("/sw.js");
+}
+
+async function enablePush(): Promise<void> {
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") {
+    throw new Error("ブラウザの通知が許可されませんでした");
+  }
+  const reg = await registerSW();
+  const key = await api.getVapidKey();
+  const sub = await reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: fromB64Url(key) as BufferSource,
+  });
+  await api.subscribePush(sub.toJSON());
+}
+
+// 通知の切替ボタンを返す。プッシュ非対応の環境では非表示のまま。
+function buildPushButton(): HTMLButtonElement {
+  const btn = el("button", { class: "ghost" });
+  btn.hidden = true;
+  if (!pushSupported()) return btn;
+  (async () => {
+    try {
+      const reg = await registerSW();
+      let enabled =
+        Notification.permission === "granted" &&
+        !!(await reg.pushManager.getSubscription());
+      const render = () => {
+        btn.textContent = enabled ? "通知オン" : "通知オフ";
+        btn.title = enabled
+          ? "クリックで通知を止める"
+          : "クリックで新着メール・共有の通知を受け取る";
+      };
+      render();
+      btn.hidden = false;
+      btn.onclick = () =>
+        run(async () => {
+          if (enabled) {
+            const sub = await reg.pushManager.getSubscription();
+            if (sub) {
+              await api.unsubscribePush(sub.endpoint);
+              await sub.unsubscribe();
+            }
+            enabled = false;
+          } else {
+            await enablePush();
+            enabled = true;
+          }
+          render();
+        });
+    } catch {
+      /* Service Worker が使えない環境(証明書エラー等)ではボタンを出さない */
+    }
+  })();
+  return btn;
+}
+
 // --- メイン画面 ---
 
 async function renderMain(): Promise<void> {
@@ -242,8 +311,8 @@ async function renderMain(): Promise<void> {
       el(
         "div",
         { class: "userbox" },
-        el("span", { class: "lock", title: "エンドツーエンド暗号化" }, "🔒"),
         `${currentUser} さん`,
+        buildPushButton(),
         passwordBtn,
         logoutBtn,
       ),
@@ -387,8 +456,7 @@ async function refreshFiles(): Promise<void> {
     const nameCell = el(
       "td",
       { class: "name-cell" },
-      el("span", { class: "icon" }, entry.is_dir ? "📁" : "📄"),
-      entry.name,
+      entry.is_dir ? entry.name + "/" : entry.name,
     );
     nameCell.onclick = () => {
       if (entry.is_dir) {
@@ -447,6 +515,16 @@ async function refreshFiles(): Promise<void> {
         actions,
       ),
     );
+    // プレビュー中のファイルなら、その行の直下にプレビューを差し込む
+    if (previewState?.path === entry.path) {
+      tbody.append(
+        el(
+          "tr",
+          { class: "preview-row" },
+          el("td", { colspan: "5" }, buildPreviewPane()),
+        ),
+      );
+    }
   }
 
   // 全選択チェックボックス
@@ -500,7 +578,6 @@ async function refreshFiles(): Promise<void> {
     entries.length
       ? table
       : el("div", { class: "empty" }, "ファイルはありません"),
-    buildPreviewPane(),
   );
 }
 
@@ -538,6 +615,7 @@ function previewKind(name: string): "image" | "pdf" | null {
 }
 
 // 選択中のプレビュー。閉じるまで(別のファイルを選ぶまで)表示し続ける。
+// ファイル一覧の該当ファイルの行の直下に表示される。
 let previewState: {
   path: string;
   name: string;
@@ -557,7 +635,7 @@ function buildPreviewPane(): HTMLElement {
   closeBtn.onclick = () => {
     if (previewState) URL.revokeObjectURL(previewState.url);
     previewState = null;
-    document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
+    run(refreshFiles);
   };
 
   const content =
@@ -583,7 +661,7 @@ async function openPreview(path: string, name: string): Promise<void> {
   );
   if (previewState) URL.revokeObjectURL(previewState.url);
   previewState = { path, name, url, kind };
-  document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
+  await refreshFiles(); // 該当ファイルの行の下にプレビュー行が入る
 }
 
 // --- テキストエディタ ---
@@ -699,6 +777,17 @@ async function refreshShares(): Promise<void> {
         );
         saveBytes(await decryptFileWithRawKey(fileKeyRaw, blob), filename);
       });
+    // 受け取った側からも共有を削除(拒否)できる
+    const del = el("button", { class: "link danger" }, "削除");
+    del.onclick = () => {
+      if (!confirm(`「${filename}」の共有を削除しますか?(相手のファイル自体は消えません)`)) {
+        return;
+      }
+      run(async () => {
+        await api.deleteShare(sh.id);
+        await refreshShares();
+      });
+    };
     receivedBody.append(
       el(
         "tr",
@@ -706,7 +795,7 @@ async function refreshShares(): Promise<void> {
         el("td", {}, filename),
         el("td", { class: "muted" }, `${sh.owner} さんから`),
         el("td", { class: "muted" }, fmtDate(sh.created_at)),
-        el("td", { class: "actions" }, dl),
+        el("td", { class: "actions" }, dl, del),
       ),
     );
   }
@@ -844,7 +933,12 @@ async function refreshMail(): Promise<void> {
       };
       rowChecks.push(check);
       const subject = await decryptSubject(m);
-      const subjectCell = el("td", { class: "name-cell" }, subject || "(件名なし)");
+      const clip = m.attachments?.length ? "[添付] " : "";
+      const subjectCell = el(
+        "td",
+        { class: "name-cell" },
+        clip + (subject || "(件名なし)"),
+      );
       subjectCell.onclick = () => run(() => openMailView(m.id));
       const del = el("button", { class: "link danger" }, "削除");
       del.onclick = () => {
@@ -919,6 +1013,7 @@ async function refreshMail(): Promise<void> {
 async function openComposeDialog(
   prefTo = "",
   prefSubject = "",
+  prefBody = "",
 ): Promise<void> {
   const dialog = el("dialog");
   // 宛先は普通のテキスト入力(datalist で登録ユーザーの補完だけ出す)
@@ -943,7 +1038,22 @@ async function openComposeDialog(
   const subject = el("input", { type: "text", placeholder: "件名" });
   subject.value = prefSubject;
   const body = el("textarea", { rows: "10", placeholder: "本文" });
+  body.value = prefBody;
   const msg = el("div", { class: "note" });
+
+  // 添付ファイル
+  const attInput = el("input", { type: "file" });
+  attInput.multiple = true;
+  attInput.hidden = true;
+  const attList = el("div", { class: "note" });
+  const attBtn = el("button", { type: "button" }, "ファイルを添付");
+  attBtn.onclick = () => attInput.click();
+  attInput.onchange = () => {
+    const files = [...(attInput.files ?? [])];
+    attList.textContent = files.length
+      ? "添付: " + files.map((f) => `${f.name} (${fmtBytes(f.size)})`).join(", ")
+      : "";
+  };
 
   const sendBtn = el("button", { class: "primary", type: "button" }, "送信");
   sendBtn.onclick = async () => {
@@ -957,15 +1067,27 @@ async function openComposeDialog(
     try {
       const te = new TextEncoder();
       const mailKey = newRawKey();
-      const [encSubject, encBody, toPub] = await Promise.all([
+      const files = [...(attInput.files ?? [])];
+      const [encSubject, encBody, toPub, attachments] = await Promise.all([
         encryptBytesWithRawKey(mailKey, te.encode(subject.value)),
         encryptBytesWithRawKey(mailKey, te.encode(body.value)),
         api.getUserPublicKey(to),
+        Promise.all(
+          files.map(async (f) => ({
+            name: f.name,
+            size: f.size,
+            data: await encryptBytesWithRawKey(
+              mailKey,
+              new Uint8Array(await f.arrayBuffer()),
+            ),
+          })),
+        ),
       ]);
       await api.sendMail({
         to,
         enc_subject: encSubject,
         enc_body: encBody,
+        attachments,
         // 宛先が読めるように相手の公開鍵で、自分も送信済みを読めるように自分の公開鍵で包む
         wrapped_key_to: await wrapKeyForUser(mailKey, toPub),
         wrapped_key_self: await wrapKeyForUser(mailKey, userKeys!.publicKeySpki),
@@ -986,7 +1108,8 @@ async function openComposeDialog(
     suggest,
     subject,
     body,
-    el("div", { class: "toolbar" }, sendBtn, closeBtn),
+    el("div", { class: "toolbar" }, attBtn, attInput, sendBtn, closeBtn),
+    attList,
     msg,
   );
   document.body.append(dialog);
@@ -1003,15 +1126,38 @@ async function openMailView(id: string): Promise<void> {
   const dialog = el("dialog", { class: "wide" });
   const pre = el("pre", { class: "mail-body" }, body);
 
+  // 添付ファイル(クリックで復号してダウンロード)
+  const attRow = el("div", { class: "attachments" });
+  for (const att of m.attachments ?? []) {
+    const btn = el(
+      "button",
+      { class: "link", type: "button" },
+      `${att.name} (${fmtBytes(att.size)})`,
+    );
+    btn.onclick = () =>
+      run(async () => {
+        saveBytes(await decryptBytesWithRawKey(mailKey, att.data ?? ""), att.name);
+      });
+    attRow.append(btn);
+  }
+
   const buttons = el("div", { class: "toolbar" });
   if (m.folder === "inbox") {
     const replyBtn = el("button", { type: "button" }, "返信");
     replyBtn.onclick = () => {
       closeDialog(dialog);
+      // 元の本文を引用して返信
+      const quoted =
+        `\n\n----- ${fmtDate(m.created_at)} ${m.from} さんのメール -----\n` +
+        body
+          .split("\n")
+          .map((line) => `> ${line}`)
+          .join("\n");
       run(() =>
         openComposeDialog(
           m.from,
           subject.startsWith("Re:") ? subject : `Re: ${subject}`,
+          quoted,
         ),
       );
     };
@@ -1029,6 +1175,7 @@ async function openMailView(id: string): Promise<void> {
       `${m.from} さんから ${m.to} さんへ · ${fmtDate(m.created_at)}`,
     ),
     pre,
+    attRow,
     buttons,
   );
   document.body.append(dialog);

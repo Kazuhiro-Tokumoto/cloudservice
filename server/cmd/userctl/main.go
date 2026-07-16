@@ -291,9 +291,9 @@ func runRemote(c *http.Client, args []string) error {
 			mark := ""
 			switch {
 			case remain < 0:
-				mark = " ★期限切れ! certbot renew 等で更新してください"
+				mark = " [警告] 期限切れ! certbot renew 等で更新してください"
 			case remain < 7*24*time.Hour:
-				mark = " ★まもなく期限切れ"
+				mark = " [警告] まもなく期限切れ"
 			}
 			fmt.Printf("証明書:       %s まで有効 (残り %d 日)%s\n",
 				st.CertNotAfter.Format("2006-01-02 15:04"), int(remain.Hours()/24), mark)

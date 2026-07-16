@@ -25,6 +25,12 @@ export interface KeyBundle {
   enc_master_key: string;
 }
 
+export interface MailAttachment {
+  name: string;
+  size: number;
+  data?: string; // メール鍵で暗号化済み (base64)。一覧では省略される
+}
+
 export interface MailMessage {
   id: string;
   folder: "inbox" | "sent";
@@ -33,6 +39,7 @@ export interface MailMessage {
   created_at: string;
   enc_subject: string;
   enc_body?: string;
+  attachments?: MailAttachment[];
   wrapped_key: string;
   size?: number;
 }
@@ -234,11 +241,35 @@ export async function sendMail(payload: {
   enc_body: string;
   wrapped_key_to: string;
   wrapped_key_self: string;
+  attachments: MailAttachment[];
 }): Promise<void> {
   await request("/api/mail", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+}
+
+// --- プッシュ通知 ---
+
+export async function getVapidKey(): Promise<string> {
+  const res = await request("/api/push/vapid");
+  return (await res.json()).public_key;
+}
+
+export async function subscribePush(subscription: unknown): Promise<void> {
+  await request("/api/push/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(subscription),
+  });
+}
+
+export async function unsubscribePush(endpoint: string): Promise<void> {
+  await request("/api/push/unsubscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint }),
   });
 }
 
