@@ -343,9 +343,47 @@ async function refreshFiles(): Promise<void> {
   const refreshBtn = el("button", {}, "更新");
   refreshBtn.onclick = () => run(refreshFiles);
 
+  // 一括選択
+  const selected = new Map<string, api.Entry>();
+  const bulkCount = el("span", { class: "bulk-count" });
+  const bulkDlBtn = el("button", {}, "一括ダウンロード");
+  const bulkDelBtn = el("button", { class: "danger-btn" }, "一括削除");
+  const updateBulk = () => {
+    const n = selected.size;
+    bulkDlBtn.disabled = bulkDelBtn.disabled = n === 0;
+    bulkCount.textContent = n ? `${n} 件選択中` : "";
+  };
+  bulkDlBtn.onclick = () =>
+    run(async () => {
+      for (const entry of selected.values()) {
+        if (!entry.is_dir) {
+          await downloadAndSave(entry.path, entry.name);
+        }
+      }
+    });
+  bulkDelBtn.onclick = () => {
+    if (!confirm(`選択した ${selected.size} 件を削除しますか?(フォルダは中身ごと消えます)`)) {
+      return;
+    }
+    run(async () => {
+      for (const path of selected.keys()) {
+        await api.deleteFile(path);
+      }
+      await refreshFiles();
+    });
+  };
+
   // ファイル一覧
+  const rowChecks: HTMLInputElement[] = [];
   const tbody = el("tbody");
   for (const entry of entries) {
+    const check = el("input", { type: "checkbox" });
+    check.onchange = () => {
+      if (check.checked) selected.set(entry.path, entry);
+      else selected.delete(entry.path);
+      updateBulk();
+    };
+    rowChecks.push(check);
     const nameCell = el(
       "td",
       { class: "name-cell" },
@@ -358,6 +396,8 @@ async function refreshFiles(): Promise<void> {
         run(refreshFiles);
       } else if (isTextFile(entry.name) && entry.size < 1024 * 1024) {
         run(() => openEditor(entry.path));
+      } else if (previewKind(entry.name)) {
+        run(() => openPreview(entry.path, entry.name));
       } else {
         run(async () => downloadAndSave(entry.path, entry.name));
       }
@@ -371,6 +411,21 @@ async function refreshFiles(): Promise<void> {
       share.onclick = () => run(() => openShareDialog(entry.path));
       actions.append(dl, share);
     }
+    const ren = el("button", { class: "link" }, "名前変更");
+    ren.onclick = () => {
+      const newName = prompt("新しい名前を入力してください", entry.name);
+      if (!newName || newName === entry.name) return;
+      if (newName.includes("/") || newName.includes("\\")) {
+        showError("名前に / は使えません");
+        return;
+      }
+      run(async () => {
+        const dir = entry.path.slice(0, entry.path.length - entry.name.length);
+        await api.renameFile(entry.path, dir + newName);
+        await refreshFiles();
+      });
+    };
+    actions.append(ren);
     const del = el("button", { class: "link danger" }, "削除");
     del.onclick = () => {
       if (!confirm(`「${entry.name}」を削除しますか?`)) return;
@@ -385,6 +440,7 @@ async function refreshFiles(): Promise<void> {
       el(
         "tr",
         {},
+        el("td", { class: "check-cell" }, check),
         nameCell,
         el("td", { class: "muted" }, entry.is_dir ? "—" : fmtSize(entry.size)),
         el("td", { class: "muted" }, fmtDate(entry.mod_time)),
@@ -392,6 +448,17 @@ async function refreshFiles(): Promise<void> {
       ),
     );
   }
+
+  // 全選択チェックボックス
+  const checkAll = el("input", { type: "checkbox", title: "すべて選択" });
+  checkAll.onchange = () => {
+    selected.clear();
+    for (let i = 0; i < entries.length; i++) {
+      rowChecks[i].checked = checkAll.checked;
+      if (checkAll.checked) selected.set(entries[i].path, entries[i]);
+    }
+    updateBulk();
+  };
 
   const table = el(
     "table",
@@ -402,6 +469,7 @@ async function refreshFiles(): Promise<void> {
       el(
         "tr",
         {},
+        el("th", { class: "check-cell" }, checkAll),
         el("th", {}, "名前"),
         el("th", {}, "サイズ"),
         el("th", {}, "更新日時"),
@@ -410,6 +478,7 @@ async function refreshFiles(): Promise<void> {
     ),
     tbody,
   );
+  updateBulk();
 
   panel.replaceChildren(
     el("h2", {}, "マイファイル"),
@@ -420,6 +489,9 @@ async function refreshFiles(): Promise<void> {
       mkdirBtn,
       newFileBtn,
       refreshBtn,
+      bulkDlBtn,
+      bulkDelBtn,
+      bulkCount,
       el("span", { class: "spacer" }),
       quotaBox,
       fileInput,
@@ -428,6 +500,7 @@ async function refreshFiles(): Promise<void> {
     entries.length
       ? table
       : el("div", { class: "empty" }, "ファイルはありません"),
+    buildPreviewPane(),
   );
 }
 
@@ -441,6 +514,76 @@ function isTextFile(name: string): boolean {
   return /\.(txt|md|json|csv|log|yaml|yml|xml|html|css|js|ts|go|py|sh|conf|ini)$/i.test(
     name,
   );
+}
+
+// --- 常設プレビュー(画像と PDF のみ。ファイル一覧の下に表示し続ける) ---
+
+const MIME_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  avif: "image/avif",
+  pdf: "application/pdf",
+};
+
+function previewKind(name: string): "image" | "pdf" | null {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const mime = MIME_TYPES[ext];
+  if (!mime) return null;
+  return mime === "application/pdf" ? "pdf" : "image";
+}
+
+// 選択中のプレビュー。閉じるまで(別のファイルを選ぶまで)表示し続ける。
+let previewState: {
+  path: string;
+  name: string;
+  url: string;
+  kind: "image" | "pdf";
+} | null = null;
+
+function buildPreviewPane(): HTMLElement {
+  const pane = el("div", { class: "preview-pane", id: "preview-pane" });
+  if (!previewState) {
+    pane.hidden = true;
+    return pane;
+  }
+  const { name, url, kind } = previewState;
+
+  const closeBtn = el("button", { class: "ghost" }, "プレビューを閉じる");
+  closeBtn.onclick = () => {
+    if (previewState) URL.revokeObjectURL(previewState.url);
+    previewState = null;
+    document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
+  };
+
+  const content =
+    kind === "image"
+      ? el("img", { src: url, alt: name })
+      : el("iframe", { src: url, title: name });
+
+  pane.append(
+    el("div", { class: "preview-head" }, el("strong", {}, name), closeBtn),
+    el("div", { class: "preview-box" }, content),
+  );
+  return pane;
+}
+
+async function openPreview(path: string, name: string): Promise<void> {
+  const kind = previewKind(name);
+  if (!kind) return;
+  const blob = await api.downloadFile(path);
+  const data = await decryptFileWithMaster(userKeys!.masterKey, blob);
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const url = URL.createObjectURL(
+    new Blob([data as BufferSource], { type: MIME_TYPES[ext]! }),
+  );
+  if (previewState) URL.revokeObjectURL(previewState.url);
+  previewState = { path, name, url, kind };
+  document.getElementById("preview-pane")?.replaceWith(buildPreviewPane());
 }
 
 // --- テキストエディタ ---
@@ -668,12 +811,38 @@ async function refreshMail(): Promise<void> {
   const refreshBtn = el("button", {}, "更新");
   refreshBtn.onclick = () => run(refreshMail);
 
+  // 一括選択(受信箱・送信済みをまたいで選択できる)
+  const selected = new Set<string>();
+  const bulkCount = el("span", { class: "bulk-count" });
+  const bulkDelBtn = el("button", { class: "danger-btn" }, "一括削除");
+  const updateBulk = () => {
+    bulkDelBtn.disabled = selected.size === 0;
+    bulkCount.textContent = selected.size ? `${selected.size} 件選択中` : "";
+  };
+  bulkDelBtn.onclick = () => {
+    if (!confirm(`選択した ${selected.size} 件のメールを削除しますか?`)) return;
+    run(async () => {
+      for (const id of selected) {
+        await api.deleteMail(id);
+      }
+      await refreshMail();
+    });
+  };
+
   const makeTable = async (
     msgs: api.MailMessage[],
     who: (m: api.MailMessage) => string,
   ) => {
+    const rowChecks: HTMLInputElement[] = [];
     const tbody = el("tbody");
     for (const m of msgs) {
+      const check = el("input", { type: "checkbox" });
+      check.onchange = () => {
+        if (check.checked) selected.add(m.id);
+        else selected.delete(m.id);
+        updateBulk();
+      };
+      rowChecks.push(check);
       const subject = await decryptSubject(m);
       const subjectCell = el("td", { class: "name-cell" }, subject || "(件名なし)");
       subjectCell.onclick = () => run(() => openMailView(m.id));
@@ -689,6 +858,7 @@ async function refreshMail(): Promise<void> {
         el(
           "tr",
           {},
+          el("td", { class: "check-cell" }, check),
           subjectCell,
           el("td", { class: "muted" }, who(m)),
           el("td", { class: "muted" }, fmtDate(m.created_at)),
@@ -696,6 +866,15 @@ async function refreshMail(): Promise<void> {
         ),
       );
     }
+    const checkAll = el("input", { type: "checkbox", title: "すべて選択" });
+    checkAll.onchange = () => {
+      for (let i = 0; i < msgs.length; i++) {
+        rowChecks[i].checked = checkAll.checked;
+        if (checkAll.checked) selected.add(msgs[i].id);
+        else selected.delete(msgs[i].id);
+      }
+      updateBulk();
+    };
     return el(
       "table",
       {},
@@ -705,6 +884,7 @@ async function refreshMail(): Promise<void> {
         el(
           "tr",
           {},
+          el("th", { class: "check-cell" }, checkAll),
           el("th", {}, "件名"),
           el("th", {}, ""),
           el("th", {}, "日時"),
@@ -714,10 +894,11 @@ async function refreshMail(): Promise<void> {
       tbody,
     );
   };
+  updateBulk();
 
   panel.replaceChildren(
     el("h2", {}, "メール"),
-    el("div", { class: "toolbar" }, composeBtn, refreshBtn),
+    el("div", { class: "toolbar" }, composeBtn, refreshBtn, bulkDelBtn, bulkCount),
     el("h3", {}, "受信箱"),
     inbox.length
       ? await makeTable(inbox, (m) => `${m.from} さんから`)
@@ -739,14 +920,26 @@ async function openComposeDialog(
   prefTo = "",
   prefSubject = "",
 ): Promise<void> {
-  const users = (await api.listUsers()).filter((u) => u !== currentUser);
-
   const dialog = el("dialog");
-  const toSelect = el("select");
-  for (const u of users) {
-    toSelect.append(el("option", { value: u }, u));
-  }
-  if (prefTo) toSelect.value = prefTo;
+  // 宛先は普通のテキスト入力(datalist で登録ユーザーの補完だけ出す)
+  const toInput = el("input", {
+    type: "text",
+    placeholder: "宛先ユーザー名",
+    list: "mail-user-suggest",
+    autocomplete: "off",
+  });
+  toInput.value = prefTo;
+  const suggest = el("datalist", { id: "mail-user-suggest" });
+  api
+    .listUsers()
+    .then((users) => {
+      for (const u of users.filter((u) => u !== currentUser)) {
+        suggest.append(el("option", { value: u }));
+      }
+    })
+    .catch(() => {
+      /* 補完が出ないだけ */
+    });
   const subject = el("input", { type: "text", placeholder: "件名" });
   subject.value = prefSubject;
   const body = el("textarea", { rows: "10", placeholder: "本文" });
@@ -754,8 +947,9 @@ async function openComposeDialog(
 
   const sendBtn = el("button", { class: "primary", type: "button" }, "送信");
   sendBtn.onclick = async () => {
-    if (!toSelect.value) {
-      msg.textContent = "宛先を選んでください";
+    const to = toInput.value.trim();
+    if (!to) {
+      msg.textContent = "宛先ユーザー名を入力してください";
       return;
     }
     sendBtn.disabled = true;
@@ -766,10 +960,10 @@ async function openComposeDialog(
       const [encSubject, encBody, toPub] = await Promise.all([
         encryptBytesWithRawKey(mailKey, te.encode(subject.value)),
         encryptBytesWithRawKey(mailKey, te.encode(body.value)),
-        api.getUserPublicKey(toSelect.value),
+        api.getUserPublicKey(to),
       ]);
       await api.sendMail({
-        to: toSelect.value,
+        to,
         enc_subject: encSubject,
         enc_body: encBody,
         // 宛先が読めるように相手の公開鍵で、自分も送信済みを読めるように自分の公開鍵で包む
@@ -788,7 +982,8 @@ async function openComposeDialog(
 
   dialog.append(
     el("h2", {}, "新規メール"),
-    el("label", {}, "宛先: ", toSelect),
+    toInput,
+    suggest,
     subject,
     body,
     el("div", { class: "toolbar" }, sendBtn, closeBtn),

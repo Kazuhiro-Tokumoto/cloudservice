@@ -17,6 +17,9 @@ import (
 // ErrBadPath は不正なパス(トラバーサル等)。
 var ErrBadPath = errors.New("不正なパスです")
 
+// ErrExists は移動先に既にファイルがある場合のエラー。
+var ErrExists = errors.New("同名のファイルまたはフォルダが既にあります")
+
 // Root はユーザーファイルの保存ルート(<dataDir>/files)。
 type Root struct {
 	dir string
@@ -190,6 +193,37 @@ func (r *Root) Stat(username, rel string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return os.Stat(abs)
+}
+
+// Rename はファイルまたはフォルダを fromRel から toRel へ移動(名前変更)する。
+// 移動先が既に存在する場合は ErrExists を返す。
+func (r *Root) Rename(username, fromRel, toRel string) error {
+	fp, err := Clean(fromRel)
+	if err != nil || fp == "" {
+		return ErrBadPath
+	}
+	tp, err := Clean(toRel)
+	if err != nil || tp == "" {
+		return ErrBadPath
+	}
+	from, err := r.resolve(username, fromRel)
+	if err != nil {
+		return err
+	}
+	to, err := r.resolve(username, toRel)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(from); err != nil {
+		return err
+	}
+	if _, err := os.Stat(to); err == nil {
+		return ErrExists
+	}
+	if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+		return err
+	}
+	return os.Rename(from, to)
 }
 
 // Usage はユーザーのホーム配下の合計サイズ(バイト)を返す。容量制限の計算用。

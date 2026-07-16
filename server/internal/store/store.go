@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -264,6 +265,33 @@ func (s *Store) DeleteShare(id, owner string) error {
 		return ErrNotFound
 	}
 	delete(s.shares, id)
+	return s.saveSharesLocked()
+}
+
+// UpdateSharePaths はファイル名変更に共有レコードのパスを追従させる。
+// from と一致する共有、および from/ 配下(フォルダ名変更)の共有を to に書き換える。
+func (s *Store) UpdateSharePaths(owner, from, to string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for id, sh := range s.shares {
+		if sh.Owner != owner {
+			continue
+		}
+		switch {
+		case sh.Path == from:
+			sh.Path = to
+		case strings.HasPrefix(sh.Path, from+"/"):
+			sh.Path = to + sh.Path[len(from):]
+		default:
+			continue
+		}
+		s.shares[id] = sh
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
 	return s.saveSharesLocked()
 }
 

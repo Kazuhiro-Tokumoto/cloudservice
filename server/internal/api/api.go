@@ -54,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("PUT /api/files/upload", s.authed(s.handleUpload))
 	mux.Handle("DELETE /api/files", s.authed(s.handleDelete))
 	mux.Handle("POST /api/files/mkdir", s.authed(s.handleMkdir))
+	mux.Handle("POST /api/files/rename", s.authed(s.handleRename))
 	mux.Handle("GET /api/users", s.authed(s.handleUsers))
 	mux.Handle("GET /api/keys", s.authed(s.handleGetKeys))
 	mux.Handle("PUT /api/keys", s.authed(s.handlePutKeys))
@@ -145,6 +146,8 @@ func fileError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, files.ErrBadPath):
 		writeErr(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, files.ErrExists):
+		writeErr(w, http.StatusConflict, err.Error())
 	case os.IsNotExist(err):
 		writeErr(w, http.StatusNotFound, "ファイルが見つかりません")
 	default:
@@ -367,6 +370,29 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, username st
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "created"})
+}
+
+func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, username string) {
+	var req struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
+		return
+	}
+	if err := s.Files.Rename(username, req.From, req.To); err != nil {
+		fileError(w, err)
+		return
+	}
+	// 共有レコードのパスも新しい名前に追従させる(共有が切れないように)
+	from, _ := files.Clean(req.From)
+	to, _ := files.Clean(req.To)
+	if err := s.Store.UpdateSharePaths(username, from, to); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "renamed"})
 }
 
 // --- 共有 ---

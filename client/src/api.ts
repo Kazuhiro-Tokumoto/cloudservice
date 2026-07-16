@@ -141,6 +141,14 @@ export async function mkdir(path: string): Promise<void> {
   });
 }
 
+export async function renameFile(from: string, to: string): Promise<void> {
+  await request("/api/files/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from, to }),
+  });
+}
+
 export async function listUsers(): Promise<string[]> {
   const res = await request("/api/users");
   return res.json();
