@@ -236,6 +236,26 @@ nav.tabs button.active {
   background: var(--accent);
 }
 
+/* 一括選択 */
+.check-cell {
+  width: 28px;
+  padding-right: 0;
+}
+
+.check-cell input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.bulk-count {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+button.danger-btn {
+  color: var(--danger);
+}
+
 /* メール本文 */
 .mail-body {
   font-family: inherit;

@@ -343,9 +343,47 @@ async function refreshFiles(): Promise<void> {
   const refreshBtn = el("button", {}, "更新");
   refreshBtn.onclick = () => run(refreshFiles);
 
+  // 一括選択
+  const selected = new Map<string, api.Entry>();
+  const bulkCount = el("span", { class: "bulk-count" });
+  const bulkDlBtn = el("button", {}, "一括ダウンロード");
+  const bulkDelBtn = el("button", { class: "danger-btn" }, "一括削除");
+  const updateBulk = () => {
+    const n = selected.size;
+    bulkDlBtn.disabled = bulkDelBtn.disabled = n === 0;
+    bulkCount.textContent = n ? `${n} 件選択中` : "";
+  };
+  bulkDlBtn.onclick = () =>
+    run(async () => {
+      for (const entry of selected.values()) {
+        if (!entry.is_dir) {
+          await downloadAndSave(entry.path, entry.name);
+        }
+      }
+    });
+  bulkDelBtn.onclick = () => {
+    if (!confirm(`選択した ${selected.size} 件を削除しますか?(フォルダは中身ごと消えます)`)) {
+      return;
+    }
+    run(async () => {
+      for (const path of selected.keys()) {
+        await api.deleteFile(path);
+      }
+      await refreshFiles();
+    });
+  };
+
   // ファイル一覧
+  const rowChecks: HTMLInputElement[] = [];
   const tbody = el("tbody");
   for (const entry of entries) {
+    const check = el("input", { type: "checkbox" });
+    check.onchange = () => {
+      if (check.checked) selected.set(entry.path, entry);
+      else selected.delete(entry.path);
+      updateBulk();
+    };
+    rowChecks.push(check);
     const nameCell = el(
       "td",
       { class: "name-cell" },
@@ -385,6 +423,7 @@ async function refreshFiles(): Promise<void> {
       el(
         "tr",
         {},
+        el("td", { class: "check-cell" }, check),
         nameCell,
         el("td", { class: "muted" }, entry.is_dir ? "—" : fmtSize(entry.size)),
         el("td", { class: "muted" }, fmtDate(entry.mod_time)),
@@ -392,6 +431,17 @@ async function refreshFiles(): Promise<void> {
       ),
     );
   }
+
+  // 全選択チェックボックス
+  const checkAll = el("input", { type: "checkbox", title: "すべて選択" });
+  checkAll.onchange = () => {
+    selected.clear();
+    for (let i = 0; i < entries.length; i++) {
+      rowChecks[i].checked = checkAll.checked;
+      if (checkAll.checked) selected.set(entries[i].path, entries[i]);
+    }
+    updateBulk();
+  };
 
   const table = el(
     "table",
@@ -402,6 +452,7 @@ async function refreshFiles(): Promise<void> {
       el(
         "tr",
         {},
+        el("th", { class: "check-cell" }, checkAll),
         el("th", {}, "名前"),
         el("th", {}, "サイズ"),
         el("th", {}, "更新日時"),
@@ -410,6 +461,7 @@ async function refreshFiles(): Promise<void> {
     ),
     tbody,
   );
+  updateBulk();
 
   panel.replaceChildren(
     el("h2", {}, "マイファイル"),
@@ -420,6 +472,9 @@ async function refreshFiles(): Promise<void> {
       mkdirBtn,
       newFileBtn,
       refreshBtn,
+      bulkDlBtn,
+      bulkDelBtn,
+      bulkCount,
       el("span", { class: "spacer" }),
       quotaBox,
       fileInput,
@@ -739,14 +794,26 @@ async function openComposeDialog(
   prefTo = "",
   prefSubject = "",
 ): Promise<void> {
-  const users = (await api.listUsers()).filter((u) => u !== currentUser);
-
   const dialog = el("dialog");
-  const toSelect = el("select");
-  for (const u of users) {
-    toSelect.append(el("option", { value: u }, u));
-  }
-  if (prefTo) toSelect.value = prefTo;
+  // 宛先は普通のテキスト入力(datalist で登録ユーザーの補完だけ出す)
+  const toInput = el("input", {
+    type: "text",
+    placeholder: "宛先ユーザー名",
+    list: "mail-user-suggest",
+    autocomplete: "off",
+  });
+  toInput.value = prefTo;
+  const suggest = el("datalist", { id: "mail-user-suggest" });
+  api
+    .listUsers()
+    .then((users) => {
+      for (const u of users.filter((u) => u !== currentUser)) {
+        suggest.append(el("option", { value: u }));
+      }
+    })
+    .catch(() => {
+      /* 補完が出ないだけ */
+    });
   const subject = el("input", { type: "text", placeholder: "件名" });
   subject.value = prefSubject;
   const body = el("textarea", { rows: "10", placeholder: "本文" });
@@ -754,8 +821,9 @@ async function openComposeDialog(
 
   const sendBtn = el("button", { class: "primary", type: "button" }, "送信");
   sendBtn.onclick = async () => {
-    if (!toSelect.value) {
-      msg.textContent = "宛先を選んでください";
+    const to = toInput.value.trim();
+    if (!to) {
+      msg.textContent = "宛先ユーザー名を入力してください";
       return;
     }
     sendBtn.disabled = true;
@@ -766,10 +834,10 @@ async function openComposeDialog(
       const [encSubject, encBody, toPub] = await Promise.all([
         encryptBytesWithRawKey(mailKey, te.encode(subject.value)),
         encryptBytesWithRawKey(mailKey, te.encode(body.value)),
-        api.getUserPublicKey(toSelect.value),
+        api.getUserPublicKey(to),
       ]);
       await api.sendMail({
-        to: toSelect.value,
+        to,
         enc_subject: encSubject,
         enc_body: encBody,
         // 宛先が読めるように相手の公開鍵で、自分も送信済みを読めるように自分の公開鍵で包む
@@ -788,7 +856,8 @@ async function openComposeDialog(
 
   dialog.append(
     el("h2", {}, "新規メール"),
-    el("label", {}, "宛先: ", toSelect),
+    toInput,
+    suggest,
     subject,
     body,
     el("div", { class: "toolbar" }, sendBtn, closeBtn),
