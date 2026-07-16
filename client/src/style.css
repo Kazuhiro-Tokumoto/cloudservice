@@ -176,10 +176,6 @@ header.topbar h1 {
   font-size: 0.88rem;
 }
 
-.lock {
-  font-size: 0.8rem;
-}
-
 /* タブ */
 nav.tabs {
   display: flex;
@@ -386,10 +382,6 @@ td.actions {
 .name-cell:hover {
   text-decoration: underline;
   text-underline-offset: 3px;
-}
-
-.name-cell .icon {
-  margin-right: 8px;
 }
 
 .empty {

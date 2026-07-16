@@ -232,7 +232,7 @@ function buildPushButton(): HTMLButtonElement {
         Notification.permission === "granted" &&
         !!(await reg.pushManager.getSubscription());
       const render = () => {
-        btn.textContent = enabled ? "🔔 通知オン" : "🔕 通知オフ";
+        btn.textContent = enabled ? "通知オン" : "通知オフ";
         btn.title = enabled
           ? "クリックで通知を止める"
           : "クリックで新着メール・共有の通知を受け取る";
@@ -311,7 +311,6 @@ async function renderMain(): Promise<void> {
       el(
         "div",
         { class: "userbox" },
-        el("span", { class: "lock", title: "エンドツーエンド暗号化" }, "🔒"),
         `${currentUser} さん`,
         buildPushButton(),
         passwordBtn,
@@ -457,8 +456,7 @@ async function refreshFiles(): Promise<void> {
     const nameCell = el(
       "td",
       { class: "name-cell" },
-      el("span", { class: "icon" }, entry.is_dir ? "📁" : "📄"),
-      entry.name,
+      entry.is_dir ? entry.name + "/" : entry.name,
     );
     nameCell.onclick = () => {
       if (entry.is_dir) {
@@ -935,7 +933,7 @@ async function refreshMail(): Promise<void> {
       };
       rowChecks.push(check);
       const subject = await decryptSubject(m);
-      const clip = m.attachments?.length ? "📎 " : "";
+      const clip = m.attachments?.length ? "[添付] " : "";
       const subjectCell = el(
         "td",
         { class: "name-cell" },
@@ -1048,7 +1046,7 @@ async function openComposeDialog(
   attInput.multiple = true;
   attInput.hidden = true;
   const attList = el("div", { class: "note" });
-  const attBtn = el("button", { type: "button" }, "📎 ファイルを添付");
+  const attBtn = el("button", { type: "button" }, "ファイルを添付");
   attBtn.onclick = () => attInput.click();
   attInput.onchange = () => {
     const files = [...(attInput.files ?? [])];
@@ -1134,7 +1132,7 @@ async function openMailView(id: string): Promise<void> {
     const btn = el(
       "button",
       { class: "link", type: "button" },
-      `📎 ${att.name} (${fmtBytes(att.size)})`,
+      `${att.name} (${fmtBytes(att.size)})`,
     );
     btn.onclick = () =>
       run(async () => {
