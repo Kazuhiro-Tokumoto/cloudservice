@@ -82,7 +82,7 @@ cp config.example.json config.json
 
 ```json
 {
-  "addr": ":40000",
+  "addr": ":443",
   "cert_dir": "certs",
   "cert_name": "mail",
   "data_dir": "data",
@@ -94,10 +94,12 @@ cp config.example.json config.json
 ```
 
 `cert_name` に証明書の名前(拡張子なし)を入れると HTTPS で起動する。
-`addr: ":40000"` で待ち受けるので、DNS で mail.shudo-physics.com を
-このサーバーの IP に向け、ファイアウォールで TCP 40000 を開けておくこと。
-ブラウザからは `https://mail.shudo-physics.com:40000/` でアクセスする
+`addr: ":443"`(HTTPS 標準ポート)で待ち受けるので、DNS で mail.shudo-physics.com を
+このサーバーの IP に向け、ファイアウォールで TCP 443 を開けておくこと。
+ブラウザからは **`https://mail.shudo-physics.com/`** とポート番号なしでアクセスできる
 (Web クライアントも同じサーバーが配信するので、これ 1 つで完結)。
+443 は特権ポートのため、sudo(root)での起動が必要
+(sudo 運用なら Let's Encrypt の直接参照と合わせてそのまま動く)。
 
 ### 4. 管理コンソール(管理者のみ)
 
@@ -160,7 +162,8 @@ cd ../server
 ./cloudserver -config config.json
 ```
 
-ブラウザで `https://<サーバー>:8443/` を開くとログイン画面が表示される。
+ブラウザで `https://<サーバー>/`(mail.shudo-physics.com なら
+`https://mail.shudo-physics.com/`)を開くとログイン画面が表示される。
 
 ### systemd で常駐させる場合
 

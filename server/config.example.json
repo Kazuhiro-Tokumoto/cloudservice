@@ -1,5 +1,5 @@
 {
-  "addr": ":40000",
+  "addr": ":443",
   "cert_dir": "certs",
   "cert_name": "",
   "cert_file": "/etc/letsencrypt/live/mail.shudo-physics.com/fullchain.pem",

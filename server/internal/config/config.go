@@ -41,7 +41,7 @@ type Config struct {
 // Default はデフォルト設定を返す。
 func Default() Config {
 	return Config{
-		Addr:         ":40000",
+		Addr:         ":443",
 		CertDir:      "certs",
 		CertName:     "",
 		DataDir:      "data",
