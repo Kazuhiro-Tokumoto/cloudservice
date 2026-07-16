@@ -30,6 +30,7 @@ import (
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/config"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/files"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/mail"
+	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/push"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/store"
 )
 
@@ -58,11 +59,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("セッション鍵の初期化に失敗: %v", err)
 	}
+	pushStore, err := push.Open(cfg.DataDir)
+	if err != nil {
+		log.Printf("プッシュ通知の初期化に失敗(通知なしで続行): %v", err)
+		pushStore = nil
+	}
 
 	srv := &api.Server{
 		Store:      st,
 		Files:      root,
 		Mail:       mailStore,
+		Push:       pushStore,
 		Signer:     signer,
 		SessionTTL: time.Duration(cfg.SessionHours) * time.Hour,
 		MaxUpload:  cfg.MaxUploadMB * 1024 * 1024,

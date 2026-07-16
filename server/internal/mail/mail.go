@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+// Attachment はメールの添付ファイル。内容はメール鍵で暗号化されている。
+type Attachment struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"` // 復号後のサイズ(表示用)
+	// Data はメール鍵で AES-GCM 暗号化した内容 (base64)。一覧では省略される。
+	Data string `json:"data,omitempty"`
+}
+
 // Message は 1 通のメール(のあるユーザーから見たコピー)。
 type Message struct {
 	ID        string    `json:"id"`
@@ -26,6 +34,8 @@ type Message struct {
 	// EncSubject / EncBody はメール鍵で AES-GCM 暗号化された件名と本文。
 	EncSubject string `json:"enc_subject"`
 	EncBody    string `json:"enc_body,omitempty"`
+	// Attachments は添付ファイル(内容もメール鍵で暗号化済み)。
+	Attachments []Attachment `json:"attachments,omitempty"`
 	// WrappedKey はこのコピーの持ち主の公開鍵で包んだメール鍵。
 	WrappedKey string `json:"wrapped_key"`
 	// Size はディスク上のサイズ(一覧表示用に List が設定する)。
@@ -103,6 +113,10 @@ func (s *Store) List(owner, folder string) ([]Message, error) {
 			continue
 		}
 		m.EncBody = ""
+		// 添付は名前とサイズだけ残して中身は落とす(一覧を軽くするため)
+		for i := range m.Attachments {
+			m.Attachments[i].Data = ""
+		}
 		m.Size = int64(len(b))
 		out = append(out, m)
 	}

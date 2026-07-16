@@ -14,9 +14,11 @@ import (
 	"strings"
 	"time"
 
+	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/auth"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/files"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/mail"
+	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/push"
 	"github.com/kazuhiro-tokumoto/cloudservice/server/internal/store"
 )
 
@@ -25,6 +27,7 @@ type Server struct {
 	Store      *store.Store
 	Files      *files.Root
 	Mail       *mail.Store
+	Push       *push.Store // nil なら通知なしで動く
 	Signer     *auth.TokenSigner
 	SessionTTL time.Duration
 	MaxUpload  int64  // バイト
@@ -65,6 +68,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/shares/{id}", s.authed(s.handleDeleteShare))
 	mux.Handle("GET /api/shared/download", s.authed(s.handleSharedDownload))
 	mux.Handle("GET /api/quota", s.authed(s.handleQuota))
+	mux.Handle("GET /api/push/vapid", s.authed(s.handleVapidKey))
+	mux.Handle("POST /api/push/subscribe", s.authed(s.handlePushSubscribe))
+	mux.Handle("POST /api/push/unsubscribe", s.authed(s.handlePushUnsubscribe))
 	mux.Handle("POST /api/mail", s.authed(s.handleSendMail))
 	mux.Handle("GET /api/mail", s.authed(s.handleListMail))
 	mux.Handle("GET /api/mail/{id}", s.authed(s.handleGetMail))
@@ -469,6 +475,10 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request, usern
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if sh.TargetUser != "" {
+		// プッシュ通知(ファイル名は載せない)
+		s.Push.Notify(sh.TargetUser, "ファイル共有", username+" さんがファイルを共有しました")
+	}
 	resp := map[string]any{"share": sh}
 	if sh.TargetUser == "" {
 		resp["url"] = "/s/" + sh.ID
@@ -509,9 +519,56 @@ func (s *Server) handleQuota(w http.ResponseWriter, _ *http.Request, username st
 	})
 }
 
-// --- メール(件名・本文とも E2E 暗号化。サーバーは暗号文と宛先しか知らない) ---
+// --- プッシュ通知 ---
 
-const maxMailSize = 2 * 1024 * 1024
+func (s *Server) handleVapidKey(w http.ResponseWriter, _ *http.Request, _ string) {
+	if s.Push == nil {
+		writeErr(w, http.StatusServiceUnavailable, "プッシュ通知は無効です")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"public_key": s.Push.PublicKey()})
+}
+
+func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request, username string) {
+	if s.Push == nil {
+		writeErr(w, http.StatusServiceUnavailable, "プッシュ通知は無効です")
+		return
+	}
+	var sub webpush.Subscription
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&sub); err != nil || sub.Endpoint == "" {
+		writeErr(w, http.StatusBadRequest, "購読情報の形式が不正です")
+		return
+	}
+	if err := s.Push.Subscribe(username, sub); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "subscribed"})
+}
+
+func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request, username string) {
+	if s.Push == nil {
+		writeErr(w, http.StatusServiceUnavailable, "プッシュ通知は無効です")
+		return
+	}
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
+		return
+	}
+	if err := s.Push.Unsubscribe(username, req.Endpoint); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "unsubscribed"})
+}
+
+// --- メール(件名・本文・添付とも E2E 暗号化。サーバーは暗号文と宛先しか知らない) ---
+
+// 添付を含むため上限は大きめ(base64 + 暗号化のオーバーヘッド込み)
+const maxMailSize = 64 * 1024 * 1024
 
 func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username string) {
 	var req struct {
@@ -519,11 +576,12 @@ func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username
 		EncSubject string `json:"enc_subject"`
 		EncBody    string `json:"enc_body"`
 		// メール鍵を宛先の公開鍵で包んだもの / 自分の公開鍵で包んだもの(送信済み用)
-		WrappedKeyTo   string `json:"wrapped_key_to"`
-		WrappedKeySelf string `json:"wrapped_key_self"`
+		WrappedKeyTo   string            `json:"wrapped_key_to"`
+		WrappedKeySelf string            `json:"wrapped_key_self"`
+		Attachments    []mail.Attachment `json:"attachments"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxMailSize)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗")
+		writeErr(w, http.StatusBadRequest, "リクエストの解析に失敗(添付が大きすぎる可能性があります)")
 		return
 	}
 	if req.To == "" || req.EncSubject == "" || req.EncBody == "" ||
@@ -539,9 +597,18 @@ func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username
 		writeErr(w, http.StatusBadRequest, "宛先ユーザーが存在しません")
 		return
 	}
+	for _, a := range req.Attachments {
+		if a.Name == "" || a.Data == "" {
+			writeErr(w, http.StatusBadRequest, "添付ファイルの形式が不正です")
+			return
+		}
+	}
 
 	// メールも保存容量(10GB)に含める。受信者・送信者の両方を確認する。
 	size := int64(len(req.EncSubject) + len(req.EncBody) + len(req.WrappedKeyTo))
+	for _, a := range req.Attachments {
+		size += int64(len(a.Data))
+	}
 	if s.usage(req.To)+size > s.Quota {
 		writeErr(w, http.StatusRequestEntityTooLarge, "宛先ユーザーの保存容量が不足しています")
 		return
@@ -558,12 +625,13 @@ func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username
 	}
 	now := time.Now()
 	base := mail.Message{
-		ID:         id,
-		From:       username,
-		To:         req.To,
-		CreatedAt:  now,
-		EncSubject: req.EncSubject,
-		EncBody:    req.EncBody,
+		ID:          id,
+		From:        username,
+		To:          req.To,
+		CreatedAt:   now,
+		EncSubject:  req.EncSubject,
+		EncBody:     req.EncBody,
+		Attachments: req.Attachments,
 	}
 	inbox := base
 	inbox.Folder = "inbox"
@@ -579,6 +647,8 @@ func (s *Server) handleSendMail(w http.ResponseWriter, r *http.Request, username
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// プッシュ通知(中身は載せない)
+	s.Push.Notify(req.To, "新着メール", username+" さんからメールが届きました")
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 

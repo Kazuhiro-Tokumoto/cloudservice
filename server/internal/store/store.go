@@ -256,12 +256,13 @@ func (s *Store) GetShare(id string) (Share, bool) {
 	return sh, true
 }
 
-// DeleteShare は owner が所有する共有を削除する。
-func (s *Store) DeleteShare(id, owner string) error {
+// DeleteShare は共有を削除する。共有した本人(owner)に加えて、
+// 共有された側(target_user)も自分宛の共有を削除(拒否)できる。
+func (s *Store) DeleteShare(id, requester string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sh, ok := s.shares[id]
-	if !ok || sh.Owner != owner {
+	if !ok || (sh.Owner != requester && sh.TargetUser != requester) {
 		return ErrNotFound
 	}
 	delete(s.shares, id)

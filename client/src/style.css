@@ -256,12 +256,17 @@ button.danger-btn {
   color: var(--danger);
 }
 
-/* 常設プレビュー(画像・PDF) */
+/* 常設プレビュー(対象ファイルの行の直下に表示) */
+tr.preview-row > td {
+  padding: 10px;
+  background: #fcfcfc;
+}
+
 .preview-pane {
-  margin-top: 20px;
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
+  background: #fff;
 }
 
 .preview-head {
@@ -409,6 +414,22 @@ td.actions {
   color: var(--muted);
 }
 
+/* メール添付 */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.attachments button {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 3px 12px;
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+
 /* ダイアログ */
 dialog {
   border: 1px solid var(--border);
@@ -441,4 +462,88 @@ dialog .toolbar {
 
 dialog::backdrop {
   background: rgba(0, 0, 0, 0.25);
+}
+
+/* スマホ対応 */
+@media (max-width: 640px) {
+  body {
+    font-size: 15px; /* タップしやすいよう少し大きく */
+  }
+
+  header.topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+
+  .userbox {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  nav.tabs {
+    padding: 0 8px;
+    overflow-x: auto;
+  }
+
+  nav.tabs button {
+    padding: 12px 14px;
+    flex: 1;
+  }
+
+  main {
+    padding: 14px 10px 40px;
+    gap: 24px;
+  }
+
+  .toolbar {
+    gap: 6px;
+  }
+
+  .toolbar .spacer {
+    flex-basis: 100%; /* 使用容量バーは次の行へ */
+  }
+
+  button {
+    padding: 8px 12px; /* タップ領域を確保 */
+  }
+
+  /* テーブルは横スクロールで収める */
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+
+  th,
+  td {
+    padding: 10px 8px;
+  }
+
+  tr.preview-row > td {
+    white-space: normal;
+  }
+
+  .preview-box iframe,
+  .preview-box img {
+    max-height: 50vh;
+  }
+
+  dialog,
+  dialog.wide {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+    padding: 16px;
+  }
+
+  .login-card {
+    width: calc(100vw - 32px);
+    padding: 28px 20px;
+  }
+
+  .quota .bar {
+    width: 100px;
+  }
 }
